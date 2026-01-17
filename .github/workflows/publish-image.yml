@@ -16,7 +16,8 @@ on:
       - .vscode/**
       - start.sh
   schedule:
-    - cron: '0 02 * * *' # daily at 02:00 UTC
+    - cron: '0 02 15 * *' # monthly on 15th at 02:00 UTC
+  workflow_dispatch:
 
 permissions:
   contents: read
