@@ -1,0 +1,62 @@
+ARG UBUNTU_VERSION=24.04
+ARG UID=1000
+ARG GID=1000
+
+FROM ubuntu:${UBUNTU_VERSION}
+
+ARG UID
+ARG GID
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install base packages
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        wget \
+        gnupg \
+        lsb-release \
+        sudo \
+        git \
+        jq \
+        unzip \
+        build-essential \
+        openjdk-17-jdk \
+        python3 \
+        python3-pip \
+        python3-venv \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Node.js (LTS) via NodeSource (Node 20/22 family)
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN npm install -g pnpm@latest
+
+RUN pnpm install -g opencode@latest
+
+# Create non-root user matching host uid/gid (defaults provided via build-args)
+RUN groupadd -g ${GID} opencode || true \
+    && useradd -m -u ${UID} -g ${GID} -s /bin/bash opencode || true \
+    && mkdir -p /workspace /home/opencode/.cache \
+    && chown -R opencode:opencode /home/opencode /workspace
+
+# Allow passwordless sudo for convenience in sandbox
+RUN echo "opencode ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/opencode && chmod 0440 /etc/sudoers.d/opencode
+
+WORKDIR /workspace
+
+# Simple entrypoint script
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+# Switch to non-root user by default
+USER opencode
+ENV HOME=/home/opencode
+ENV PATH="/home/opencode/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+CMD ["bash"]
