@@ -36,7 +36,7 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
 
 RUN wget -qO- https://get.pnpm.io/install.sh | ENV="$HOME/.bashrc" SHELL="$(which bash)" bash -
 
-RUN npm install -g opencode@latest
+RUN npm install -g opencode-ai@latest
 
 # Create non-root user matching host uid/gid (defaults provided via build-args)
 RUN groupadd -g ${GID} opencode || true \
