@@ -13,6 +13,10 @@ Options:
   -p, --http-proxy URL      HTTP proxy to pass into container
       --https-proxy URL     HTTPS proxy to pass into container
       --no-proxy LIST       Comma-separated no_proxy list
+  -m, --mount HOST:CONTAINER[:ro|rw]
+                            Additional mount (repeatable). HOST may be relative; CONTAINER
+                            may be absolute or relative to the container workdir.
+      --dry-run             Print the final docker command and exit without running it
   -E, --env KEY=VAL         Pass an environment variable into the container (may repeat)
       --env-file FILE       Pass an env file to docker (each line VAR=VAL)
       --no-auto-forward    Do not automatically forward host OPENCODE_* env vars
@@ -45,6 +49,13 @@ NO_PROXY_DEFAULT=""
 ENV_ARGS=()
 ENV_FILE=""
 AUTO_FORWARD_OPENCODE=true
+# Additional mounts provided by user with -m/--mount; can repeat.
+# Syntax: host_path:container_path[:ro|rw]
+# - host_path: absolute or relative host path (will be canonicalized)
+# - container_path: absolute path inside container or relative (resolved under CONTAINER_WORKDIR)
+# - mode: optional, either 'ro' or 'rw' (default: rw)
+MOUNTS=()
+DRY_RUN=false
 
 # Parse args
 while [[ $# -gt 0 ]]; do
@@ -57,6 +68,11 @@ while [[ $# -gt 0 ]]; do
       NAME="$2"; shift 2 ;;
     -w|--workdir)
       CONTAINER_WORKDIR="$2"; shift 2 ;;
+    -m|--mount)
+      # Accept mounts like host:container or host:container:ro
+      MOUNTS+=("$2"); shift 2 ;;
+    --dry-run)
+      DRY_RUN=true; shift ;;
     -p|--http-proxy)
       HTTP_PROXY="$2"; shift 2 ;;
     --https-proxy)
@@ -157,15 +173,54 @@ PROJECT_HOST_PATH="$(cd "$PROJECT_PATH" && pwd)"
 CONTAINER_WORKDIR="${CONTAINER_WORKDIR%/}"
 CONTAINER_PROJECT_PATH="$CONTAINER_WORKDIR$PROJECT_HOST_PATH"
 
+# Process user-provided mounts
+# Each mount is host_path:container_path[:mode]
+process_mount() {
+  local raw="$1"
+  # Split into host, container, and optional mode
+  IFS=':' read -r host_path container_path mode <<<"$raw"
+  # container_path is required
+  if [ -z "$container_path" ]; then
+    echo "Invalid mount specification: $raw" >&2; return 1
+  fi
+  # Make host_path absolute if relative
+  if [[ "$host_path" != /* ]]; then host_path="$(cd "$host_path" && pwd)"; fi
+  if [ ! -e "$host_path" ]; then echo "Warning: host path '$host_path' does not exist" >&2; fi
+  # Default mode to rw when not provided
+  if [ -z "$mode" ]; then mode="rw"; fi
+  if [ "$mode" != "ro" ] && [ "$mode" != "rw" ]; then
+    echo "Invalid mount mode '$mode' in '$raw' (must be ro or rw)" >&2; return 1
+  fi
+  # Resolve container_path under container workdir when relative
+  if [[ "$container_path" != /* ]]; then
+    container_path="$CONTAINER_WORKDIR$container_path"
+  fi
+  # Output the mount spec only (host:container:mode). Caller will add the -v flag separately.
+  printf '%s' "$host_path:$container_path:$mode"
+}
+
 # Build docker run command
 DOCKER_CMD=(docker run --rm -it \
   --add-host=host.docker.internal:host-gateway \
-  --name "$NAME" \
+  --name "$NAME")
+
+# Add default mounts
+DOCKER_CMD+=(
+  -v "$HOME/.bun:/home/opencode/.bun:rw" \
+  -v "$HOME/.pnpm-store:/home/opencode/.pnpm-store:rw" \
+  -v "$HOME/.cache/opencode:/home/opencode/.cache/opencode:rw" \
   -v "$HOME/.local/state/opencode:/home/opencode/.local/state/opencode:rw" \
   -v "$HOME/.local/share/opencode:/home/opencode/.local/share/opencode:rw" \
   -v "$HOME/.config/opencode:/home/opencode/.config/opencode:rw" \
   -v "$PROJECT_HOST_PATH:$CONTAINER_PROJECT_PATH:rw" \
-  -w "$CONTAINER_PROJECT_PATH")
+  -w "$CONTAINER_PROJECT_PATH"
+)
+
+# Append user mounts
+for m in "${MOUNTS[@]}"; do
+  mount_arg="$(process_mount "$m")"
+  DOCKER_CMD+=("-v" "$mount_arg")
+done
 
 # Append env args
 for arg in "${ENV_ARGS[@]}"; do
@@ -179,6 +234,27 @@ fi
 
 # Append image and command
 DOCKER_CMD+=("$IMAGE" opencode)
+
+# If dry run, print final command and exit
+if [ "$DRY_RUN" = true ]; then
+  echo "Dry run: final docker command (each arg on its own line, shell-escaped):"
+  for arg in "${DOCKER_CMD[@]}"; do
+    printf '%s\n' "$(printf '%q' "$arg")"
+  done
+  echo
+  echo "One-line command (copy/paste):"
+  # Build one-line safely by joining escaped args
+  one_line=""
+  for arg in "${DOCKER_CMD[@]}"; do
+    if [ -z "$one_line" ]; then
+      one_line="$(printf '%q' "$arg")"
+    else
+      one_line="$one_line $(printf '%q' "$arg")"
+    fi
+  done
+  printf '%s\n' "$one_line"
+  exit 0
+fi
 
 # Execute
 "${DOCKER_CMD[@]}"

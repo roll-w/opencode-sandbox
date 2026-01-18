@@ -34,8 +34,8 @@ RUN npm install -g pnpm@latest \
 
 RUN npm install -g opencode-ai@latest
 
-ARG USER_UID=1000
-ARG USER_GID=1000
+ARG USER_UID=1001
+ARG USER_GID=1001
 
 # Create or reuse group and user matching specified numeric ids.
 # This handles the case where the requested UID/GID already exist in the base image.
