@@ -1,7 +1,6 @@
 ARG UBUNTU_VERSION=24.04
 FROM ubuntu:${UBUNTU_VERSION}
 
-
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Install base packages
@@ -35,10 +34,14 @@ RUN npm install -g pnpm@latest \
 
 RUN npm install -g opencode-ai@latest
 
-RUN groupadd -r opencode \
-    && useradd -m -r -g opencode -s /bin/bash opencode \
-    && mkdir -p /workspace /home/opencode/.cache \
-    && chown -R opencode:opencode /home/opencode /workspace
+ARG USER_UID=1000
+ARG USER_GID=1000
+
+RUN groupadd -g ${USER_GID} opencode \
+    && useradd -m -u ${USER_UID} -g opencode -s /bin/bash opencode \
+    && mkdir -p /workspace /home/opencode/.config/opencode /home/opencode/.local/share/opencode /home/opencode/.local/state/opencode  \
+    /home/opencode/.cache/opencode /home/opencode/.bun /home/opencode/.pnpm-store \
+    && chown -R ${USER_UID}:${USER_GID} /home/opencode /workspace
 
 # Allow passwordless sudo for convenience in sandbox
 RUN echo "opencode ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/opencode && chmod 0440 /etc/sudoers.d/opencode
