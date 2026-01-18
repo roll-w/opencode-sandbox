@@ -12,6 +12,9 @@ if [ "$(id -u)" -eq 0 ] && [ -n "${HOST_UID-}" ]; then
   exec su - opencode -c "$*"
 fi
 
+mkdir -p /workspace /home/opencode/.config/opencode /home/opencode/.local/share/opencode \
+  /home/opencode/.local/state/opencode /home/opencode/.cache/opencode /home/opencode/.bun /home/opencode/.pnpm-store
+
 # Show helpful environment info
 echo "Opencode sandbox ready"
 echo "User: $(whoami) UID: $(id -u) GID: $(id -g)"

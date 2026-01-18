@@ -30,7 +30,8 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
 
-RUN npm install -g pnpm@latest
+RUN npm install -g pnpm@latest \
+    && pnpm config set store-dir /home/opencode/.pnpm-store
 
 RUN npm install -g opencode-ai@latest
 
