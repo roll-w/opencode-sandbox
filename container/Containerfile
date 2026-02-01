@@ -24,6 +24,7 @@ RUN apt-get update \
         vim \
         tree \
         acl \
+        passwd \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Node.js (LTS) via NodeSource (Node 20/22 family)
@@ -35,35 +36,52 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
 RUN npm install -g pnpm@latest \
     && pnpm config set store-dir /home/opencode/.pnpm-store
 
+RUN npx playwright install-deps chromium  \
+    && npm install -g agent-browser  \
+    && agent-browser install
+
 RUN npm install -g opencode-ai@latest
 
-ARG USER_UID=1001
-ARG USER_GID=1001
+ARG USER_UID=1000
+ARG USER_GID=1000
 
-# Create or reuse group and user matching specified numeric ids.
-# This handles the case where the requested UID/GID already exist in the base image.
 RUN set -eux; \
     if getent group "${USER_GID}" >/dev/null 2>&1; then \
-      EXISTING_GROUP=$(getent group "${USER_GID}" | cut -d: -f1); \
-      echo "GID ${USER_GID} already exists as ${EXISTING_GROUP}"; \
-      GROUP_NAME=${EXISTING_GROUP}; \
+        EXISTING_GROUP=$(getent group "${USER_GID}" | cut -d: -f1); \
+        [ "${EXISTING_GROUP}" != "opencode" ] && groupmod -n opencode "${EXISTING_GROUP}"; \
+    elif getent group opencode >/dev/null 2>&1; then \
+        groupmod -g "${USER_GID}" opencode; \
     else \
-      groupadd -g "${USER_GID}" opencode; GROUP_NAME=opencode; \
+        groupadd -g "${USER_GID}" opencode; \
     fi; \
+    \
     if getent passwd "${USER_UID}" >/dev/null 2>&1; then \
-      EXISTING_USER=$(getent passwd "${USER_UID}" | cut -d: -f1); \
-      echo "UID ${USER_UID} already exists as ${EXISTING_USER}"; \
-      if [ "${EXISTING_USER}" = "opencode" ]; then \
-        USER_NAME=opencode; \
-      else \
-        useradd -o -u "${USER_UID}" -g "${GROUP_NAME}" -s /bin/bash -m opencode || true; \
-        USER_NAME=opencode; \
-      fi; \
+        EXISTING_USER=$(getent passwd "${USER_UID}" | cut -d: -f1); \
+        if [ "${EXISTING_USER}" != "opencode" ]; then \
+            getent passwd opencode >/dev/null 2>&1 && userdel -f opencode; \
+            usermod -l opencode "${EXISTING_USER}"; \
+            usermod -d /home/opencode -m opencode; \
+        fi; \
+    elif getent passwd opencode >/dev/null 2>&1; then \
+        usermod -u "${USER_UID}" opencode; \
     else \
-      useradd -m -u "${USER_UID}" -g "${GROUP_NAME}" -s /bin/bash opencode; USER_NAME=opencode; \
+        useradd -m -u "${USER_UID}" -g opencode -s /bin/bash opencode; \
     fi; \
-    mkdir -p /workspace /home/opencode/.config/opencode /home/opencode/.local/share/opencode /home/opencode/.local/state/opencode /home/opencode/.cache/opencode /home/opencode/.bun /home/opencode/.pnpm-store; \
-    chown -R "${USER_UID}":"${USER_GID}" /home/opencode /workspace
+    \
+    CURRENT_HOME=$(getent passwd opencode | cut -d: -f6); \
+        if [ "$CURRENT_HOME" != "/home/opencode" ]; then \
+            mkdir -p /home/opencode; \
+            chown opencode:opencode /home/opencode; \
+            usermod -d /home/opencode opencode; \
+        fi; \
+    mkdir -p /workspace \
+             /home/opencode/.config/opencode \
+             /home/opencode/.local/share/opencode \
+             /home/opencode/.local/state/opencode \
+             /home/opencode/.cache/opencode \
+             /home/opencode/.bun \
+             /home/opencode/.pnpm-store; \
+    chown -R "${USER_UID}:${USER_GID}" /home/opencode /workspace
 
 # Allow passwordless sudo for convenience in sandbox
 RUN echo "opencode ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/opencode && chmod 0440 /etc/sudoers.d/opencode
