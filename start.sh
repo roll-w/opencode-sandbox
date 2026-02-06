@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
   cat <<EOF
-Usage: $0 [options] [project_path]
+Usage: $0 [options] [project_path] [-- [opencode_args...]]
 
 Options:
   -i, --image IMAGE         Docker image to use (overrides auto-detection)
@@ -20,15 +20,21 @@ Options:
   -E, --env KEY=VAL         Pass an environment variable into the container (may repeat)
       --env-file FILE       Pass an env file to docker (each line VAR=VAL)
       --no-auto-forward    Do not automatically forward host OPENCODE_* env vars
+  -M, --mode MODE           Startup mode: opencode (default), web, shell
   -h, --help                Show this help
 
-Place your global OpenCode config in ~/.config/opencode/opencode.json.
-Use global config for user-wide preferences like themes, providers, or keybinds.
+--mode choices:
+  opencode  Directly run opencode [args...] (default)
+  web       Run opencode web [args...] inside container
+  shell     Start the container and open a shell (no opencode process)
+
+Arguments after -- are forwarded as CLI options to opencode or opencode web (not used for shell mode).
 
 Examples:
   $0
   $0 -i ghcr.io/roll-w/opencode-sandbox:main /path/to/project
-  $0 --config ~/.config/opencode
+  $0 --mode web -- --port 8123
+  $0 --mode shell
   $0 -p http://proxy:3128 -E OPENCODE_DISABLE_LSP_DOWNLOAD=false
 EOF
 }
@@ -56,6 +62,10 @@ AUTO_FORWARD_OPENCODE=true
 # - mode: optional, either 'ro' or 'rw' (default: rw)
 MOUNTS=()
 DRY_RUN=false
+
+# Startup mode: opencode (default), web, or shell
+MODE="opencode"
+OPENCODE_ARGS=()
 
 # Parse args
 while [[ $# -gt 0 ]]; do
@@ -85,10 +95,15 @@ while [[ $# -gt 0 ]]; do
       ENV_FILE="$2"; shift 2 ;;
     --no-auto-forward)
       AUTO_FORWARD_OPENCODE=false; shift ;;
+    -M|--mode)
+      MODE="$2"; shift 2 ;;
     -h|--help)
       usage; exit 0 ;;
     --)
-      shift; break ;;
+      shift
+      # After --, all args go to opencode/web
+      OPENCODE_ARGS=("$@")
+      break ;;
     -* )
       echo "Unknown option: $1" >&2; usage; exit 1 ;;
     * )
@@ -201,6 +216,7 @@ process_mount() {
 
 # Build docker run command
 DOCKER_CMD=(docker run --rm -it \
+  --network host \
   --add-host=host.docker.internal:host-gateway \
   --name "$NAME")
 
@@ -232,8 +248,27 @@ if [ -n "$ENV_FILE" ]; then
   DOCKER_CMD+=("--env-file" "$ENV_FILE")
 fi
 
-# Append image and command
-DOCKER_CMD+=("$IMAGE" opencode)
+# Append image and command by mode
+case "$MODE" in
+  opencode)
+    DOCKER_CMD+=("$IMAGE" opencode)
+    ;;
+  web)
+    DOCKER_CMD+=("$IMAGE" opencode web)
+    ;;
+  shell)
+    DOCKER_CMD+=("$IMAGE" bash)
+    ;;
+  *)
+    echo "Unknown mode: $MODE (expected: opencode, web, shell)" >&2
+    exit 1
+    ;;
+esac
+
+# Append extra args for opencode[ web]
+if [ "$MODE" = "opencode" ] || [ "$MODE" = "web" ]; then
+  DOCKER_CMD+=("${OPENCODE_ARGS[@]}")
+fi
 
 # If dry run, print final command and exit
 if [ "$DRY_RUN" = true ]; then
