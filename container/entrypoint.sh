@@ -12,6 +12,8 @@ if [ "$(id -u)" -eq 0 ] && [ -n "${HOST_UID-}" ]; then
   exec su - opencode -c "$*"
 fi
 
+pnpm config set store-dir /home/opencode/.pnpm-store --global
+
 # Show helpful environment info
 echo "Opencode sandbox ready"
 echo "User: $(whoami) UID: $(id -u) GID: $(id -g)"
