@@ -10,9 +10,15 @@ Options:
   -c, --config DIR          Config directory (default: ~/.config/opencode)
   -n, --name NAME           Container name (default: opencode-temp)
   -w, --workdir DIR         Container working dir (default: /workspace/project)
-  -p, --http-proxy URL      HTTP proxy to pass into container
+  -P, --http-proxy URL      HTTP proxy to pass into container
       --https-proxy URL     HTTPS proxy to pass into container
       --no-proxy LIST       Comma-separated no_proxy list
+  -p, --port PORT           Port mapping to expose (repeatable). Accepts:
+                            - host_ip:host_port:container_port (e.g. 127.0.0.1:8080:8080)
+                            - host_port:container_port (e.g. 8080:8080)
+                            - container_port (e.g. 8080) which maps the same port on the host
+                            Can be repeated to add multiple mappings.
+  -N, --network MODE        Docker network mode or network name to pass to --network
   -m, --mount HOST:CONTAINER[:ro|rw]
                             Additional mount (repeatable). HOST may be relative; CONTAINER
                             may be absolute or relative to the container workdir.
@@ -30,12 +36,13 @@ Options:
 
 Arguments after -- are forwarded as CLI options to opencode or opencode web (not used for shell mode).
 
-Examples:
+  Examples:
   $0
   $0 -i ghcr.io/roll-w/opencode-sandbox:main /path/to/project
   $0 --mode web -- --port 8123
   $0 --mode shell
-  $0 -p http://proxy:3128 -E OPENCODE_DISABLE_LSP_DOWNLOAD=false
+  $0 -P http://proxy:3128 -E OPENCODE_DISABLE_LSP_DOWNLOAD=false
+  $0 -p 8080:8080 -N host /path/to/project
 EOF
 }
 
@@ -50,6 +57,12 @@ NAME="opencode-temp"
 HTTP_PROXY_DEFAULT=""
 HTTPS_PROXY_DEFAULT=""
 NO_PROXY_DEFAULT=""
+
+# Port mappings collected from -p/--port
+PORT_MAPPINGS=()
+
+# Network mode (passed to docker --network)
+NETWORK_MODE=""
 
 # Collected docker env args
 ENV_ARGS=()
@@ -83,12 +96,16 @@ while [[ $# -gt 0 ]]; do
       MOUNTS+=("$2"); shift 2 ;;
     --dry-run)
       DRY_RUN=true; shift ;;
-    -p|--http-proxy)
+    -P|--http-proxy)
       HTTP_PROXY="$2"; shift 2 ;;
     --https-proxy)
       HTTPS_PROXY="$2"; shift 2 ;;
     --no-proxy)
       NO_PROXY="$2"; shift 2 ;;
+    -p|--port)
+      PORT_MAPPINGS+=("$2"); shift 2 ;;
+    -N|--network)
+      NETWORK_MODE="$2"; shift 2 ;;
     -E|--env)
       ENV_ARGS+=("-e" "$2"); shift 2 ;;
     --env-file)
@@ -168,10 +185,6 @@ if [ "$AUTO_FORWARD_OPENCODE" = true ]; then
   done < <(env)
 fi
 
-# Default OpenCode-specific env fallback
-OPENCODE_DISABLE_LSP_DOWNLOAD="${OPENCODE_DISABLE_LSP_DOWNLOAD:-true}"
-ENV_ARGS+=("-e" "OPENCODE_DISABLE_LSP_DOWNLOAD=$OPENCODE_DISABLE_LSP_DOWNLOAD")
-
 echo "Place your global OpenCode config in $HOME/.config/opencode/opencode.json"
 echo "Use global config for user-wide preferences like themes, providers, or keybinds."
 
@@ -216,7 +229,6 @@ process_mount() {
 
 # Build docker run command
 DOCKER_CMD=(docker run --rm -it \
-  --network host \
   --add-host=host.docker.internal:host-gateway \
   --name "$NAME")
 
@@ -242,6 +254,27 @@ done
 for arg in "${ENV_ARGS[@]}"; do
   DOCKER_CMD+=("$arg")
 done
+
+# Append port mappings (if any) before the image
+for mapping in "${PORT_MAPPINGS[@]}"; do
+  # Accept forms: ip:host:container, host:container, container
+  case "$mapping" in
+    *:*:*)
+      # ip:host:container
+      DOCKER_CMD+=("-p" "$mapping") ;;
+    *:*)
+      # host:container
+      DOCKER_CMD+=("-p" "$mapping") ;;
+    *)
+      # single port -> map same port on host
+      DOCKER_CMD+=("-p" "${mapping}:${mapping}") ;;
+  esac
+done
+
+# Append network mode if provided
+if [ -n "$NETWORK_MODE" ]; then
+  DOCKER_CMD+=("--network" "$NETWORK_MODE")
+fi
 
 # Append env-file if specified
 if [ -n "$ENV_FILE" ]; then
