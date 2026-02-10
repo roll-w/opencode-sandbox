@@ -95,8 +95,8 @@ The helper script automatically:
 
 ## Proxies and networking
 
-- The script accepts `-p/--http-proxy`, `--https-proxy`, and `--no-proxy` to forward proxy settings into the container.
-- localhost/127.0.0.1 in proxy hostnames are translated to `host.docker.internal` so the container can reach host services.
+- The script accepts `---http-proxy`, `--https-proxy`, and `--no-proxy` to forward proxy settings into the container.
+- `localhost`/`127.0.0.1` in proxy hostnames are translated to `host.docker.internal` so the container can reach host services.
 
 ## Contributing
 
