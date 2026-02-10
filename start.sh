@@ -10,6 +10,8 @@ Options:
   -c, --config DIR          Config directory (default: ~/.config/opencode)
   -n, --name NAME           Container name (default: opencode-temp)
   -w, --workdir DIR         Container working dir (default: /workspace/project)
+  -u, --user UID[:GID]      Run as specified user (forwarded to docker --user)
+  -U, --update              Pull image to check for updates before running
   -P, --http-proxy URL      HTTP proxy to pass into container
       --https-proxy URL     HTTPS proxy to pass into container
       --no-proxy LIST       Comma-separated no_proxy list
@@ -75,10 +77,13 @@ AUTO_FORWARD_OPENCODE=true
 # - mode: optional, either 'ro' or 'rw' (default: rw)
 MOUNTS=()
 DRY_RUN=false
+PULL_UPDATE=false
 
 # Startup mode: opencode (default), web, or shell
 MODE="opencode"
 OPENCODE_ARGS=()
+
+USER_SPEC=""
 
 # Parse args
 while [[ $# -gt 0 ]]; do
@@ -91,6 +96,10 @@ while [[ $# -gt 0 ]]; do
       NAME="$2"; shift 2 ;;
     -w|--workdir)
       CONTAINER_WORKDIR="$2"; shift 2 ;;
+    -u|--user)
+      USER_SPEC="$2"; shift 2 ;;
+    -U|--update)
+      PULL_UPDATE=true; shift ;;
     -m|--mount)
       # Accept mounts like host:container or host:container:ro
       MOUNTS+=("$2"); shift 2 ;;
@@ -138,11 +147,40 @@ CONFIG_DIR="${CONFIG_DIR:-$HOME/.config/opencode}"
 
 NAME="opencode-$(date +%s)"
 
+if [ "$DRY_RUN" != true ]; then
+  if [ "$PULL_UPDATE" = true ]; then
+    echo "Checking for image updates..."
+    docker pull "$IMAGE"
+  elif ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+    echo "Image '$IMAGE' not found locally. Pulling..."
+    docker pull "$IMAGE"
+  fi
+fi
+
 if [ ! -d "$PROJECT_PATH" ]; then
   echo "Error: Project path '$PROJECT_PATH' does not exist or is not a directory." >&2
   exit 1
 fi
 mkdir -p "$CONFIG_DIR"
+
+if [ -n "$USER_SPEC" ]; then
+  SPEC_UID="${USER_SPEC%%:*}"
+  if [ "$SPEC_UID" = "0" ]; then
+    HOME_IN_CONTAINER="/root"
+  else
+    HOME_IN_CONTAINER="/home/opencode"
+  fi
+else
+  HOME_IN_CONTAINER="/home/opencode"
+fi
+
+PNPM_STORE_HOST="${HOME}/.local/share/pnpm/store"
+if command -v pnpm >/dev/null 2>&1; then
+  PNPM_DETECTED=$(pnpm store path 2>/dev/null || true)
+  if [ -n "$PNPM_DETECTED" ]; then
+    PNPM_STORE_HOST=$(dirname "$PNPM_DETECTED")
+  fi
+fi
 
 # Determine proxy values, prefer explicit flags/env then fall back to defaults
 HTTP_PROXY="${HTTP_PROXY:-${http_proxy:-${HTTP_PROXY_DEFAULT}}}"
@@ -190,7 +228,7 @@ echo "Use global config for user-wide preferences like themes, providers, or key
 
 echo "Starting temporary container '$NAME' from image '$IMAGE'"
 echo "  Project: $PROJECT_PATH -> $CONTAINER_WORKDIR"
-echo "  Config:  $CONFIG_DIR -> /home/opencode/.config/opencode"
+echo "  Config:  $CONFIG_DIR -> ${HOME_IN_CONTAINER}/.config/opencode"
 echo "  Forwarded env count: ${#ENV_ARGS[@]}"
 echo ""
 
@@ -234,12 +272,12 @@ DOCKER_CMD=(docker run --rm -it \
 
 # Add default mounts
 DOCKER_CMD+=(
-  -v "$HOME/.bun:/home/opencode/.bun:rw" \
-  -v "$HOME/.pnpm-store:/home/opencode/.pnpm-store:rw" \
-  -v "$HOME/.cache/opencode:/home/opencode/.cache/opencode:rw" \
-  -v "$HOME/.local/state/opencode:/home/opencode/.local/state/opencode:rw" \
-  -v "$HOME/.local/share/opencode:/home/opencode/.local/share/opencode:rw" \
-  -v "$HOME/.config/opencode:/home/opencode/.config/opencode:rw" \
+  -v "$HOME/.bun:${HOME_IN_CONTAINER}/.bun:rw" \
+  -v "$PNPM_STORE_HOST:${HOME_IN_CONTAINER}/.pnpm-store:rw" \
+  -v "$HOME/.cache/opencode:${HOME_IN_CONTAINER}/.cache/opencode:rw" \
+  -v "$HOME/.local/state/opencode:${HOME_IN_CONTAINER}/.local/state/opencode:rw" \
+  -v "$HOME/.local/share/opencode:${HOME_IN_CONTAINER}/.local/share/opencode:rw" \
+  -v "$HOME/.config/opencode:${HOME_IN_CONTAINER}/.config/opencode:rw" \
   -v "$PROJECT_HOST_PATH:$CONTAINER_PROJECT_PATH:rw" \
   -w "$CONTAINER_PROJECT_PATH"
 )
@@ -279,6 +317,10 @@ fi
 # Append env-file if specified
 if [ -n "$ENV_FILE" ]; then
   DOCKER_CMD+=("--env-file" "$ENV_FILE")
+fi
+
+if [ -n "$USER_SPEC" ]; then
+  DOCKER_CMD+=("--user" "$USER_SPEC")
 fi
 
 # Append image and command by mode
