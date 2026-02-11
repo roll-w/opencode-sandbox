@@ -33,9 +33,19 @@ env:
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tag }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+      - name: Generate image tag
+        id: meta
+        run: |
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          TAG="${TIMESTAMP}-${SHORT_SHA}"
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          echo "Image tag: ${TAG}"
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v2
       - name: Set up Docker Buildx
@@ -55,4 +65,4 @@ jobs:
           platforms: linux/amd64,linux/arm64
           tags: |
             ghcr.io/${{ env.namespace }}/opencode-sandbox:main
-            ghcr.io/${{ env.namespace }}/opencode-sandbox:${{ github.sha }}
+            ghcr.io/${{ env.namespace }}/opencode-sandbox:${{ steps.meta.outputs.tag }}
