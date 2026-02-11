@@ -34,46 +34,30 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && rm -rf /var/lib/apt/lists/*
 
 RUN npm install -g pnpm@latest \
-    && pnpm config set store-dir /home/opencode/.pnpm-store
-
-RUN npx playwright install-deps chromium  \
+    && pnpm config set store-dir /home/opencode/.pnpm-store \
+    && npx playwright install-deps chromium  \
     && npm install -g agent-browser  \
     && agent-browser install
 
 RUN npm install -g opencode-ai@latest
 
-ARG USER_UID=1000
-ARG USER_GID=1000
-
 RUN set -eux; \
-    if getent group "${USER_GID}" >/dev/null 2>&1; then \
-        EXISTING_GROUP=$(getent group "${USER_GID}" | cut -d: -f1); \
-        [ "${EXISTING_GROUP}" != "opencode" ] && groupmod -n opencode "${EXISTING_GROUP}"; \
-    elif getent group opencode >/dev/null 2>&1; then \
-        groupmod -g "${USER_GID}" opencode; \
-    else \
-        groupadd -g "${USER_GID}" opencode; \
-    fi; \
-    \
-    if getent passwd "${USER_UID}" >/dev/null 2>&1; then \
-        EXISTING_USER=$(getent passwd "${USER_UID}" | cut -d: -f1); \
-        if [ "${EXISTING_USER}" != "opencode" ]; then \
-            getent passwd opencode >/dev/null 2>&1 && userdel -f opencode; \
-            usermod -l opencode "${EXISTING_USER}"; \
-            usermod -d /home/opencode -m opencode; \
+    if getent group 1000 >/dev/null 2>&1; then \
+        EXISTING_GROUP=$(getent group 1000 | cut -d: -f1); \
+        if [ "$EXISTING_GROUP" != "opencode" ]; then \
+            groupmod -n opencode "$EXISTING_GROUP"; \
         fi; \
-    elif getent passwd opencode >/dev/null 2>&1; then \
-        usermod -u "${USER_UID}" opencode; \
     else \
-        useradd -m -u "${USER_UID}" -g opencode -s /bin/bash opencode; \
+        groupadd -g 1000 opencode; \
     fi; \
-    \
-    CURRENT_HOME=$(getent passwd opencode | cut -d: -f6); \
-        if [ "$CURRENT_HOME" != "/home/opencode" ]; then \
-            mkdir -p /home/opencode; \
-            chown opencode:opencode /home/opencode; \
-            usermod -d /home/opencode opencode; \
+    if getent passwd 1000 >/dev/null 2>&1; then \
+        EXISTING_USER=$(getent passwd 1000 | cut -d: -f1); \
+        if [ "$EXISTING_USER" != "opencode" ]; then \
+            usermod -l opencode -d /home/opencode -m "$EXISTING_USER"; \
         fi; \
+    else \
+        useradd -m -u 1000 -g opencode -s /bin/bash opencode; \
+    fi; \
     mkdir -p /workspace \
              /home/opencode/.config/opencode \
              /home/opencode/.local/share/opencode \
@@ -81,7 +65,16 @@ RUN set -eux; \
              /home/opencode/.cache/opencode \
              /home/opencode/.bun \
              /home/opencode/.pnpm-store; \
-    chown -R "${USER_UID}:${USER_GID}" /home/opencode /workspace
+    chown -R opencode:opencode /home/opencode /workspace
+
+# Install fixuid for runtime UID/GID adjustment
+# See: https://github.com/boxboat/fixuid
+RUN ARCH=$(dpkg --print-architecture) && \
+    curl -SsL "https://github.com/boxboat/fixuid/releases/download/v0.6.0/fixuid-0.6.0-linux-${ARCH}.tar.gz" | tar -C /usr/local/bin -xzf - && \
+    chown root:root /usr/local/bin/fixuid && \
+    chmod 4755 /usr/local/bin/fixuid && \
+    mkdir -p /etc/fixuid && \
+    printf "user: opencode\ngroup: opencode\npaths:\n  - /home/opencode\n" > /etc/fixuid/config.yml
 
 # Allow passwordless sudo for convenience in sandbox
 RUN echo "opencode ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/opencode && chmod 0440 /etc/sudoers.d/opencode
@@ -93,9 +86,10 @@ COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
 # Switch to non-root user by default
-USER opencode
-ENV HOME=/home/opencode
+USER opencode:opencode
+
 ENV PATH="/home/opencode/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
-ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+# Use fixuid as entrypoint - it will adjust UID/GID and then run the provided command
+ENTRYPOINT ["fixuid", "-q", "/usr/local/bin/entrypoint.sh"]
 CMD ["bash"]
