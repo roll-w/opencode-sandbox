@@ -278,6 +278,7 @@ DOCKER_CMD+=(
   -v "$HOME/.local/state/opencode:${HOME_IN_CONTAINER}/.local/state/opencode:rw" \
   -v "$HOME/.local/share/opencode:${HOME_IN_CONTAINER}/.local/share/opencode:rw" \
   -v "$HOME/.config/opencode:${HOME_IN_CONTAINER}/.config/opencode:rw" \
+  -v "$HOME/.agents/skills:${HOME_IN_CONTAINER}/.agents/skills:rw" \
   -v "$PROJECT_HOST_PATH:$CONTAINER_PROJECT_PATH:rw" \
   -w "$CONTAINER_PROJECT_PATH"
 )
