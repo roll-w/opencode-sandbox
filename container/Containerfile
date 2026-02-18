@@ -1,6 +1,17 @@
 ARG UBUNTU_VERSION=24.04
 FROM ubuntu:${UBUNTU_VERSION}
 
+# OCI Image Labels
+# See: https://github.com/opencontainers/image-spec/blob/main/annotations.md
+LABEL org.opencontainers.image.title="OpenCode Sandbox" \
+      org.opencontainers.image.description="A lightweight container-based environment for running OpenCode and related tooling in an isolated, reproducible container." \
+      org.opencontainers.image.authors="RollW" \
+      org.opencontainers.image.vendor="RollW" \
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.url="https://github.com/roll-w/opencode-sandbox" \
+      org.opencontainers.image.source="https://github.com/roll-w/opencode-sandbox" \
+      org.opencontainers.image.documentation="https://github.com/roll-w/opencode-sandbox"
+
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Install base packages
