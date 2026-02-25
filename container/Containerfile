@@ -47,6 +47,7 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
 RUN npm install -g pnpm@latest \
     && pnpm config set store-dir /home/opencode/.pnpm-store \
     && npx playwright install-deps chromium  \
+    && npm install -g @fission-ai/openspec@latest  \
     && npm install -g agent-browser  \
     && agent-browser install
 
