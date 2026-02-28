@@ -36,20 +36,17 @@ RUN apt-get update \
         tree \
         acl \
         passwd \
-    && rm -rf /var/lib/apt/lists/*
-
-# Install Node.js (LTS) via NodeSource (Node 20/22 family)
-RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get update \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
 
 RUN npm install -g pnpm@latest \
     && pnpm config set store-dir /home/opencode/.pnpm-store \
-    && npx playwright install-deps chromium  \
     && npm install -g @fission-ai/openspec@latest  \
     && npm install -g agent-browser  \
-    && agent-browser install
+    && agent-browser install --with-deps \
+    && rm -rf /var/lib/apt/lists/*
 
 RUN npm install -g opencode-ai@latest
 
