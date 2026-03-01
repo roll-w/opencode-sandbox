@@ -13,6 +13,7 @@ LABEL org.opencontainers.image.title="OpenCode Sandbox" \
       org.opencontainers.image.documentation="https://github.com/roll-w/opencode-sandbox"
 
 ENV DEBIAN_FRONTEND=noninteractive
+ENV PLAYWRIGHT_BROWSERS_PATH=/home/opencode/.cache/ms-playwright
 
 # Install base packages
 RUN apt-get update \
@@ -41,15 +42,6 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
 
-RUN npm install -g pnpm@latest \
-    && pnpm config set store-dir /home/opencode/.pnpm-store \
-    && npm install -g @fission-ai/openspec@latest  \
-    && npm install -g agent-browser  \
-    && agent-browser install --with-deps \
-    && rm -rf /var/lib/apt/lists/*
-
-RUN npm install -g opencode-ai@latest
-
 RUN set -eux; \
     if getent group 1000 >/dev/null 2>&1; then \
         EXISTING_GROUP=$(getent group 1000 | cut -d: -f1); \
@@ -75,6 +67,15 @@ RUN set -eux; \
              /home/opencode/.bun \
              /home/opencode/.pnpm-store; \
     chown -R opencode:opencode /home/opencode /workspace
+
+RUN npm install -g pnpm@latest \
+    && pnpm config set store-dir /home/opencode/.pnpm-store \
+    && npm install -g @fission-ai/openspec@latest  \
+    && npm install -g agent-browser  \
+    && agent-browser install --with-deps \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN npm install -g opencode-ai@latest
 
 # Install fixuid for runtime UID/GID adjustment
 # See: https://github.com/boxboat/fixuid
