@@ -36,6 +36,8 @@ RUN apt-get update \
         tree \
         ripgrep \
         passwd \
+        xvfb \
+        x11-apps \
     && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get update \
     && apt-get install -y --no-install-recommends nodejs \
