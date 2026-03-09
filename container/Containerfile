@@ -29,7 +29,6 @@ RUN apt-get update \
         jq \
         unzip \
         build-essential \
-        openjdk-17-jdk \
         python3 \
         python3-pip \
         python3-venv \
@@ -69,10 +68,10 @@ RUN set -eux; \
     chown -R opencode:opencode /home/opencode /workspace
 
 RUN npm install -g pnpm@latest \
+    && npx playwright install --with-deps chromium \
     && pnpm config set store-dir /home/opencode/.pnpm-store \
     && npm install -g @fission-ai/openspec@latest  \
     && npm install -g agent-browser  \
-    && agent-browser install --with-deps \
     && rm -rf /var/lib/apt/lists/*
 
 RUN npm install -g opencode-ai@latest
