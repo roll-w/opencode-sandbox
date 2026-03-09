@@ -1,6 +1,6 @@
 # OpenCode Sandbox
 
-OpenCode Sandbox provides a lightweight container-based environment for running the OpenCode project and related tooling in an isolated, reproducible container.
+OpenCode Sandbox provides a lightweight container-based environment for running the [OpenCode](https://github.com/anomalyco/opencode) project and related tooling in an isolated, reproducible container.
 
 It bundles a small developer image (see `container/Containerfile`) with common tools installed so you can quickly open a workspace, run the OpenCode CLI, and iterate on projects without polluting your host environment.
 
@@ -52,7 +52,8 @@ Notes:
 The image installs a curated set of developer tooling useful for OpenCode development:
 
 - Node.js (via NodeSource) and global `pnpm` (store configured)
-- OpenJDK 17, Python 3 (venv, pip), build-essential, git, jq, curl, wget
+- Python 3 (venv, pip), build-essential, git, jq, curl, wget
+- Agent-related tools like `opencode`, `agent-browser`
 
 See `container/Containerfile` for the full list and exact versions.
 
