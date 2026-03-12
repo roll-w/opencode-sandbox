@@ -8,8 +8,8 @@ Usage: $0 [options] [project_path] [-- [opencode_args...]]
 Options:
   -i, --image IMAGE         Docker image to use (overrides auto-detection)
   -c, --config DIR          Config directory (default: ~/.config/opencode)
-  -n, --name NAME           Container name (default: opencode-temp)
-  -w, --workdir DIR         Container working dir (default: /workspace/project)
+  -n, --name NAME           Container name (default: opencode-<timestamp>)
+  -w, --workdir DIR         Container working dir (default: /workspace)
   -u, --user UID[:GID]      Run as specified user (forwarded to docker --user)
   -U, --update              Pull image to check for updates before running
   -P, --http-proxy URL      HTTP proxy to pass into container
@@ -29,6 +29,7 @@ Options:
       --env-file FILE       Pass an env file to docker (each line VAR=VAL)
       --no-auto-forward    Do not automatically forward host OPENCODE_* env vars
   -M, --mode MODE           Startup mode: opencode (default), web, shell
+  -k, --keep-running        Keep the container running after the session exits
   -h, --help                Show this help
 
 --mode choices:
@@ -54,6 +55,8 @@ PROJECT_PATH=""
 CONFIG_DIR=""
 CONTAINER_WORKDIR="/workspace"
 NAME="opencode-temp"
+NAME_SET=false
+KEEP_CONTAINER_RUNNING=false
 
 # Proxy defaults (empty by default; only set when provided)
 HTTP_PROXY_DEFAULT=""
@@ -93,7 +96,7 @@ while [[ $# -gt 0 ]]; do
     -c|--config)
       CONFIG_DIR="$2"; shift 2 ;;
     -n|--name)
-      NAME="$2"; shift 2 ;;
+      NAME="$2"; NAME_SET=true; shift 2 ;;
     -w|--workdir)
       CONTAINER_WORKDIR="$2"; shift 2 ;;
     -u|--user)
@@ -123,6 +126,8 @@ while [[ $# -gt 0 ]]; do
       AUTO_FORWARD_OPENCODE=false; shift ;;
     -M|--mode)
       MODE="$2"; shift 2 ;;
+    -k|--keep-running)
+      KEEP_CONTAINER_RUNNING=true; shift ;;
     -h|--help)
       usage; exit 0 ;;
     --)
@@ -145,7 +150,9 @@ fi
 PROJECT_PATH="${PROJECT_PATH:-$(pwd)}"
 CONFIG_DIR="${CONFIG_DIR:-$HOME/.config/opencode}"
 
-NAME="opencode-$(date +%s)"
+if [ "$NAME_SET" != true ]; then
+  NAME="opencode-$(date +%s)"
+fi
 
 if [ "$DRY_RUN" != true ]; then
   if [ "$PULL_UPDATE" = true ]; then
@@ -265,10 +272,58 @@ process_mount() {
   printf '%s' "$host_path:$container_path:$mode"
 }
 
+print_dry_run_command() {
+  local title="$1"
+  shift
+
+  echo "$title"
+  for arg in "$@"; do
+    printf '%s\n' "$(printf '%q' "$arg")"
+  done
+
+  echo
+  echo "One-line command (copy/paste):"
+  printf '%s\n' "$(build_one_line_command "$@")"
+}
+
+build_one_line_command() {
+  local one_line=""
+
+  for arg in "$@"; do
+    if [ -z "$one_line" ]; then
+      one_line="$(printf '%q' "$arg")"
+    else
+      one_line="$one_line $(printf '%q' "$arg")"
+    fi
+  done
+
+  printf '%s' "$one_line"
+}
+
+print_reentry_instructions() {
+  local reentry_command
+  reentry_command="$(build_one_line_command "${EXEC_CMD[@]}")"
+  printf 'Re-enter with: %s\n' "$reentry_command"
+
+  if [ "$MODE" != "shell" ]; then
+    local shell_command
+    shell_command="$(build_one_line_command "${SHELL_EXEC_CMD[@]}")"
+    printf 'Open a shell instead: %s\n' "$shell_command"
+  fi
+
+  printf 'Stop and remove with: docker rm -f %q\n' "$NAME"
+}
+
 # Build docker run command
-DOCKER_CMD=(docker run --rm -it \
-  --add-host=host.docker.internal:host-gateway \
-  --name "$NAME")
+if [ "$KEEP_CONTAINER_RUNNING" = true ]; then
+  DOCKER_CMD=(docker run -d \
+    --add-host=host.docker.internal:host-gateway \
+    --name "$NAME")
+else
+  DOCKER_CMD=(docker run --rm -it \
+    --add-host=host.docker.internal:host-gateway \
+    --name "$NAME")
+fi
 
 # Add default mounts
 DOCKER_CMD+=(
@@ -325,47 +380,93 @@ if [ -n "$USER_SPEC" ]; then
   DOCKER_CMD+=("--user" "$USER_SPEC")
 fi
 
-# Append image and command by mode
-case "$MODE" in
-  opencode)
-    DOCKER_CMD+=("$IMAGE" opencode)
-    ;;
-  web)
-    DOCKER_CMD+=("$IMAGE" opencode web)
-    ;;
-  shell)
-    DOCKER_CMD+=("$IMAGE" bash)
-    ;;
-  *)
-    echo "Unknown mode: $MODE (expected: opencode, web, shell)" >&2
-    exit 1
-    ;;
-esac
+EXEC_CMD=()
+SHELL_EXEC_CMD=()
 
-# Append extra args for opencode[ web]
-if [ "$MODE" = "opencode" ] || [ "$MODE" = "web" ]; then
-  DOCKER_CMD+=("${OPENCODE_ARGS[@]}")
+if [ "$KEEP_CONTAINER_RUNNING" = true ]; then
+  DOCKER_CMD+=("$IMAGE" sleep infinity)
+  EXEC_CMD=(docker exec -it -w "$CONTAINER_PROJECT_PATH")
+  SHELL_EXEC_CMD=(docker exec -it -w "$CONTAINER_PROJECT_PATH")
+
+  if [ -n "$USER_SPEC" ]; then
+    EXEC_CMD+=("-u" "$USER_SPEC")
+    SHELL_EXEC_CMD+=("-u" "$USER_SPEC")
+  fi
+
+  EXEC_CMD+=("$NAME")
+  SHELL_EXEC_CMD+=("$NAME" bash)
+
+  case "$MODE" in
+    opencode)
+      EXEC_CMD+=(opencode)
+      ;;
+    web)
+      EXEC_CMD+=(opencode web)
+      ;;
+    shell)
+      EXEC_CMD+=(bash)
+      ;;
+    *)
+      echo "Unknown mode: $MODE (expected: opencode, web, shell)" >&2
+      exit 1
+      ;;
+  esac
+
+  if [ "$MODE" = "opencode" ] || [ "$MODE" = "web" ]; then
+    EXEC_CMD+=("${OPENCODE_ARGS[@]}")
+  fi
+else
+  # Append image and command by mode
+  case "$MODE" in
+    opencode)
+      DOCKER_CMD+=("$IMAGE" opencode)
+      ;;
+    web)
+      DOCKER_CMD+=("$IMAGE" opencode web)
+      ;;
+    shell)
+      DOCKER_CMD+=("$IMAGE" bash)
+      ;;
+    *)
+      echo "Unknown mode: $MODE (expected: opencode, web, shell)" >&2
+      exit 1
+      ;;
+  esac
+
+  # Append extra args for opencode[ web]
+  if [ "$MODE" = "opencode" ] || [ "$MODE" = "web" ]; then
+    DOCKER_CMD+=("${OPENCODE_ARGS[@]}")
+  fi
 fi
 
 # If dry run, print final command and exit
 if [ "$DRY_RUN" = true ]; then
-  echo "Dry run: final docker command (each arg on its own line, shell-escaped):"
-  for arg in "${DOCKER_CMD[@]}"; do
-    printf '%s\n' "$(printf '%q' "$arg")"
-  done
-  echo
-  echo "One-line command (copy/paste):"
-  # Build one-line safely by joining escaped args
-  one_line=""
-  for arg in "${DOCKER_CMD[@]}"; do
-    if [ -z "$one_line" ]; then
-      one_line="$(printf '%q' "$arg")"
-    else
-      one_line="$one_line $(printf '%q' "$arg")"
-    fi
-  done
-  printf '%s\n' "$one_line"
+  if [ "$KEEP_CONTAINER_RUNNING" = true ]; then
+    print_dry_run_command "Dry run: detached keepalive container command (each arg on its own line, shell-escaped):" "${DOCKER_CMD[@]}"
+    echo
+    print_dry_run_command "Dry run: interactive session command (each arg on its own line, shell-escaped):" "${EXEC_CMD[@]}"
+  else
+    print_dry_run_command "Dry run: final docker command (each arg on its own line, shell-escaped):" "${DOCKER_CMD[@]}"
+  fi
   exit 0
+fi
+
+if [ "$KEEP_CONTAINER_RUNNING" = true ]; then
+  echo "Keep-running mode enabled: container '$NAME' will remain running after you exit the session."
+  CONTAINER_ID="$("${DOCKER_CMD[@]}")"
+  echo "Started keepalive container '$NAME' (${CONTAINER_ID})."
+  print_reentry_instructions
+  echo ""
+
+  set +e
+  "${EXEC_CMD[@]}"
+  EXEC_STATUS=$?
+  set -e
+
+  echo ""
+  echo "Session exited. Container '$NAME' is still running."
+  print_reentry_instructions
+  exit "$EXEC_STATUS"
 fi
 
 # Execute
