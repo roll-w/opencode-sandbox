@@ -27,7 +27,7 @@ Options:
       --dry-run             Print the final docker command and exit without running it
   -E, --env KEY=VAL         Pass an environment variable into the container (may repeat)
       --env-file FILE       Pass an env file to docker (each line VAR=VAL)
-      --no-auto-forward    Do not automatically forward host OPENCODE_* env vars
+      --no-auto-forward     Do not automatically forward host OPENCODE_* env vars
   -M, --mode MODE           Startup mode: opencode (default), web, shell
   -k, --keep-running        Keep the container running after the session exits
   -h, --help                Show this help
