@@ -274,6 +274,7 @@ process_mount() {
 
 print_dry_run_command() {
   local title="$1"
+  local one_line
   shift
 
   echo "$title"
@@ -283,7 +284,8 @@ print_dry_run_command() {
 
   echo
   echo "One-line command (copy/paste):"
-  printf '%s\n' "$(build_one_line_command "$@")"
+  one_line=$(build_one_line_command "$@")
+  printf '%s\n' "$one_line"
 }
 
 build_one_line_command() {
@@ -301,13 +303,13 @@ build_one_line_command() {
 }
 
 print_reentry_instructions() {
-  local reentry_command
-  reentry_command="$(build_one_line_command "${EXEC_CMD[@]}")"
+  local reentry_command shell_command
+
+  reentry_command=$(build_one_line_command "${EXEC_CMD[@]}")
   printf 'Re-enter with: %s\n' "$reentry_command"
 
   if [ "$MODE" != "shell" ]; then
-    local shell_command
-    shell_command="$(build_one_line_command "${SHELL_EXEC_CMD[@]}")"
+    shell_command=$(build_one_line_command "${SHELL_EXEC_CMD[@]}")
     printf 'Open a shell instead: %s\n' "$shell_command"
   fi
 
@@ -453,7 +455,7 @@ fi
 
 if [ "$KEEP_CONTAINER_RUNNING" = true ]; then
   echo "Keep-running mode enabled: container '$NAME' will remain running after you exit the session."
-  CONTAINER_ID="$("${DOCKER_CMD[@]}")"
+  CONTAINER_ID=$("${DOCKER_CMD[@]}")
   echo "Started keepalive container '$NAME' (${CONTAINER_ID})."
   print_reentry_instructions
   echo ""
