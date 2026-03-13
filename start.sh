@@ -24,6 +24,13 @@ Options:
   -m, --mount HOST:CONTAINER[:ro|rw]
                             Additional mount (repeatable). HOST may be relative; CONTAINER
                             may be absolute or relative to the container workdir.
+      --toolchain-volume-name NAME
+                            Shared Docker volume name for toolchain caches.
+      --toolchain-preset NAME
+                            Enable a toolchain preset or comma-separated preset list.
+                            Repeatable. No default presets are enabled.
+      --toolchain-path CONTAINER_PATH
+                            Add an extra container path into the shared toolchain volume.
       --dry-run             Print the final docker command and exit without running it
   -E, --env KEY=VAL         Pass an environment variable into the container (may repeat)
       --env-file FILE       Pass an env file to docker (each line VAR=VAL)
@@ -46,6 +53,13 @@ Arguments after -- are forwarded as CLI options to opencode or opencode web (not
   $0 --mode shell
   $0 -P http://proxy:3128 -E OPENCODE_DISABLE_LSP_DOWNLOAD=false
   $0 -p 8080:8080 -N host /path/to/project
+  $0 --toolchain-preset maven,gradle,go /path/to/project
+  $0 --toolchain-preset dotnet --toolchain-path /home/opencode/.cache/uv /path/to/project
+
+Toolchain cache targets share one Docker volume.
+Presets are loaded from config/toolchain-volume-presets.conf in this repo and from
+the configured config dir's toolchain-volume-presets.conf when present.
+Each non-empty preset line should use: preset_name:container_path
 EOF
 }
 
@@ -79,6 +93,9 @@ AUTO_FORWARD_OPENCODE=true
 # - container_path: absolute path inside container or relative (resolved under CONTAINER_WORKDIR)
 # - mode: optional, either 'ro' or 'rw' (default: rw)
 MOUNTS=()
+TOOLCHAIN_VOLUME_TARGETS=()
+TOOLCHAIN_LINKS=()
+FOUND_TOOLCHAIN_PRESETS=()
 DRY_RUN=false
 PULL_UPDATE=false
 
@@ -87,6 +104,28 @@ MODE="opencode"
 OPENCODE_ARGS=()
 
 USER_SPEC=""
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TOOLCHAIN_VOLUME_NAME="opencode-sandbox-toolchains"
+TOOLCHAIN_PRESET_ARGS=()
+TOOLCHAIN_PRESETS=()
+TOOLCHAIN_PATH_ARGS=()
+
+add_toolchain_preset() {
+  local preset="$1"
+  local existing
+
+  if [ -z "$preset" ]; then
+    return
+  fi
+
+  for existing in "${TOOLCHAIN_PRESETS[@]}"; do
+    if [ "$existing" = "$preset" ]; then
+      return
+    fi
+  done
+
+  TOOLCHAIN_PRESETS+=("$preset")
+}
 
 # Parse args
 while [[ $# -gt 0 ]]; do
@@ -106,6 +145,12 @@ while [[ $# -gt 0 ]]; do
     -m|--mount)
       # Accept mounts like host:container or host:container:ro
       MOUNTS+=("$2"); shift 2 ;;
+    --toolchain-volume-name)
+      TOOLCHAIN_VOLUME_NAME="$2"; shift 2 ;;
+    --toolchain-preset)
+      TOOLCHAIN_PRESET_ARGS+=("$2"); shift 2 ;;
+    --toolchain-path)
+      TOOLCHAIN_PATH_ARGS+=("$2"); shift 2 ;;
     --dry-run)
       DRY_RUN=true; shift ;;
     -P|--http-proxy)
@@ -149,6 +194,8 @@ fi
 
 PROJECT_PATH="${PROJECT_PATH:-$(pwd)}"
 CONFIG_DIR="${CONFIG_DIR:-$HOME/.config/opencode}"
+TOOLCHAIN_PRESETS_FILE="$CONFIG_DIR/toolchain-volume-presets.conf"
+BUILTIN_TOOLCHAIN_PRESETS_FILE="$SCRIPT_DIR/config/toolchain-volume-presets.conf"
 
 if [ "$NAME_SET" != true ]; then
   NAME="opencode-$(date +%s)"
@@ -170,6 +217,11 @@ if [ ! -d "$PROJECT_PATH" ]; then
 fi
 mkdir -p "$CONFIG_DIR"
 
+if [ -z "$TOOLCHAIN_VOLUME_NAME" ]; then
+  echo "Error: toolchain volume name must not be empty." >&2
+  exit 1
+fi
+
 if [ -n "$USER_SPEC" ]; then
   SPEC_UID="${USER_SPEC%%:*}"
   if [ "$SPEC_UID" = "0" ]; then
@@ -180,6 +232,8 @@ if [ -n "$USER_SPEC" ]; then
 else
   HOME_IN_CONTAINER="/home/opencode"
 fi
+
+TOOLCHAIN_VOLUME_ROOT="${HOME_IN_CONTAINER}/.toolchain-cache"
 
 PNPM_STORE_HOST="${HOME}/.local/share/pnpm/store"
 if command -v pnpm >/dev/null 2>&1; then
@@ -230,21 +284,93 @@ if [ "$AUTO_FORWARD_OPENCODE" = true ]; then
   done < <(env)
 fi
 
-echo "Place your global OpenCode config in $HOME/.config/opencode/opencode.json"
-echo "Use global config for user-wide preferences like themes, providers, or keybinds."
-
-echo "Starting temporary container '$NAME' from image '$IMAGE'"
-echo "  Project: $PROJECT_PATH -> $CONTAINER_WORKDIR"
-echo "  Config:  $CONFIG_DIR -> ${HOME_IN_CONTAINER}/.config/opencode"
-echo "  Forwarded env count: ${#ENV_ARGS[@]}"
-echo ""
-
 # Compute container mount path: preserve host path under container workdir
 # Make PROJECT_PATH absolute (canonicalize) to build a predictable container path
 PROJECT_HOST_PATH="$(cd "$PROJECT_PATH" && pwd)"
 # Remove any trailing slash from CONTAINER_WORKDIR to avoid double slashes
 CONTAINER_WORKDIR="${CONTAINER_WORKDIR%/}"
 CONTAINER_PROJECT_PATH="$CONTAINER_WORKDIR$PROJECT_HOST_PATH"
+DEFAULT_BIND_TARGETS=(
+  "${HOME_IN_CONTAINER}/.bun"
+  "${HOME_IN_CONTAINER}/.pnpm-store"
+  "${HOME_IN_CONTAINER}/.cache/opencode"
+  "${HOME_IN_CONTAINER}/.local/state/opencode"
+  "${HOME_IN_CONTAINER}/.local/share/opencode"
+  "${HOME_IN_CONTAINER}/.config/opencode"
+  "${HOME_IN_CONTAINER}/.agents"
+  "${HOME_IN_CONTAINER}/.config/openspec"
+  "$CONTAINER_PROJECT_PATH"
+)
+
+resolve_container_path() {
+  local container_path="$1"
+
+  if [[ "$container_path" = /* ]]; then
+    printf '%s' "$container_path"
+    return
+  fi
+
+  printf '%s/%s' "$CONTAINER_WORKDIR" "$container_path"
+}
+
+normalize_container_path() {
+  local container_path normalized part
+  local -a path_parts
+
+  container_path="$(resolve_container_path "$1")"
+  if command -v realpath >/dev/null 2>&1; then
+    realpath -m -- "$container_path"
+    return
+  fi
+
+  normalized="/"
+  IFS='/' read -r -a path_parts <<<"${container_path#/}"
+
+  for part in "${path_parts[@]}"; do
+    case "$part" in
+      ''|.)
+        continue
+        ;;
+      ..)
+        if [ "$normalized" != "/" ]; then
+          normalized="${normalized%/*}"
+          if [ -z "$normalized" ]; then
+            normalized="/"
+          fi
+        fi
+        ;;
+      *)
+        if [ "$normalized" = "/" ]; then
+          normalized="/$part"
+        else
+          normalized="$normalized/$part"
+        fi
+        ;;
+    esac
+  done
+
+  printf '%s' "$normalized"
+}
+
+trim_whitespace() {
+  local value="$1"
+
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s' "$value"
+}
+
+expand_toolchain_preset_args() {
+  local raw_preset part
+  local -a preset_parts
+
+  for raw_preset in "${TOOLCHAIN_PRESET_ARGS[@]}"; do
+    IFS=',' read -r -a preset_parts <<<"$raw_preset"
+    for part in "${preset_parts[@]}"; do
+      add_toolchain_preset "$(trim_whitespace "$part")"
+    done
+  done
+}
 
 # Process user-provided mounts
 # Each mount is host_path:container_path[:mode]
@@ -264,12 +390,271 @@ process_mount() {
   if [ "$mode" != "ro" ] && [ "$mode" != "rw" ]; then
     echo "Invalid mount mode '$mode' in '$raw' (must be ro or rw)" >&2; return 1
   fi
-  # Resolve container_path under container workdir when relative
-  if [[ "$container_path" != /* ]]; then
-    container_path="$CONTAINER_WORKDIR$container_path"
-  fi
+  container_path="$(normalize_container_path "$container_path")"
   # Output the mount spec only (host:container:mode). Caller will add the -v flag separately.
   printf '%s' "$host_path:$container_path:$mode"
+}
+
+has_toolchain_target() {
+  local target="$1"
+  local existing
+
+  for existing in "${TOOLCHAIN_VOLUME_TARGETS[@]}"; do
+    if [ "$existing" = "$target" ]; then
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+has_explicit_target() {
+  local target="$1"
+  local raw source container_path mode
+
+  target="$(normalize_container_path "$target")"
+
+  for raw in "${MOUNTS[@]}"; do
+    IFS=':' read -r source container_path mode <<<"$raw"
+    if [ -n "$container_path" ] && [ "$(normalize_container_path "$container_path")" = "$target" ]; then
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+paths_overlap() {
+  local left
+  local right
+
+  left="$(normalize_container_path "$1")"
+  right="$(normalize_container_path "$2")"
+
+  if [ "$left" = "$right" ]; then
+    return 0
+  fi
+
+  if [ "$left" = "/" ] || [ "$right" = "/" ]; then
+    return 0
+  fi
+
+  case "$left" in
+    "$right"/*)
+      return 0
+      ;;
+  esac
+
+  case "$right" in
+    "$left"/*)
+      return 0
+      ;;
+  esac
+
+  return 1
+}
+
+find_bind_target_conflict() {
+  local target="$1"
+  local bind_target raw source container_path mode
+
+  target="$(normalize_container_path "$target")"
+
+  for bind_target in "${DEFAULT_BIND_TARGETS[@]}"; do
+    if paths_overlap "$target" "$bind_target"; then
+      printf '%s' "$bind_target"
+      return 0
+    fi
+  done
+
+  for raw in "${MOUNTS[@]}"; do
+    IFS=':' read -r source container_path mode <<<"$raw"
+    if [ -n "$container_path" ]; then
+      bind_target="$(normalize_container_path "$container_path")"
+      if paths_overlap "$target" "$bind_target"; then
+        printf '%s' "$bind_target"
+        return 0
+      fi
+    fi
+  done
+
+  return 1
+}
+
+is_selected_toolchain_preset() {
+  local preset="$1"
+  local selected
+
+  for selected in "${TOOLCHAIN_PRESETS[@]}"; do
+    if [ "$selected" = "$preset" ]; then
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+toolchain_subdir_name() {
+  local target_path="$1"
+  local digest
+
+  if command -v sha256sum >/dev/null 2>&1; then
+    digest=$(printf '%s' "$target_path" | sha256sum)
+    digest=${digest%% *}
+    printf 'toolchain-%s' "$digest"
+    return
+  fi
+
+  set -- $(printf '%s' "$target_path" | cksum)
+  printf 'toolchain-%s' "$1"
+}
+
+mark_toolchain_preset_found() {
+  local preset="$1"
+  local existing
+
+  for existing in "${FOUND_TOOLCHAIN_PRESETS[@]}"; do
+    if [ "$existing" = "$preset" ]; then
+      return
+    fi
+  done
+
+  FOUND_TOOLCHAIN_PRESETS+=("$preset")
+}
+
+register_toolchain_target() {
+  local source_name="$1"
+  local target_path="$2"
+  local conflicting_bind_target
+  local subdir
+
+  if [ -z "$source_name" ]; then
+    echo "Invalid toolchain source name: '$source_name'" >&2; return 1
+  fi
+
+  if [ -z "$target_path" ]; then
+    echo "Invalid toolchain target: '$target_path'" >&2; return 1
+  fi
+
+  target_path="$(normalize_container_path "$target_path")"
+
+  if [ "$target_path" = "/" ]; then
+    echo "Error: toolchain target '/' is not allowed." >&2
+    return 1
+  fi
+
+  subdir="$(toolchain_subdir_name "$target_path")"
+
+  if conflicting_bind_target="$(find_bind_target_conflict "$target_path")"; then
+    echo "Error: toolchain target '$target_path' overlaps bind mount target '$conflicting_bind_target'." >&2
+    return 1
+  fi
+
+  if has_explicit_target "$target_path" || has_toolchain_target "$target_path"; then
+    return
+  fi
+
+  TOOLCHAIN_VOLUME_TARGETS+=("$target_path")
+  TOOLCHAIN_LINKS+=("${subdir}|${target_path}")
+}
+
+load_toolchain_preset_file() {
+  local preset_file="$1"
+  local raw line preset_name target_path ignored_extra
+
+  if [ ! -f "$preset_file" ]; then
+    return
+  fi
+
+  while IFS= read -r raw || [ -n "$raw" ]; do
+    line="$(trim_whitespace "$raw")"
+    case "$line" in
+      ''|'#'*)
+        continue
+        ;;
+    esac
+
+    IFS=':' read -r preset_name target_path ignored_extra <<<"$line"
+    preset_name="$(trim_whitespace "$preset_name")"
+    target_path="$(trim_whitespace "$target_path")"
+
+    if [ -z "$preset_name" ] || [ -z "$target_path" ]; then
+      echo "Invalid toolchain preset line: $line" >&2
+      return 1
+    fi
+
+    if is_selected_toolchain_preset "$preset_name"; then
+      mark_toolchain_preset_found "$preset_name"
+      register_toolchain_target "$preset_name" "$target_path"
+    fi
+  done < "$preset_file"
+}
+
+validate_toolchain_presets() {
+  local preset
+
+  for preset in "${TOOLCHAIN_PRESETS[@]}"; do
+    if ! is_selected_toolchain_preset "$preset"; then
+      continue
+    fi
+    if ! is_found_toolchain_preset "$preset"; then
+      echo "Error: unknown toolchain preset '$preset'." >&2
+      return 1
+    fi
+  done
+}
+
+is_found_toolchain_preset() {
+  local preset="$1"
+  local found
+
+  for found in "${FOUND_TOOLCHAIN_PRESETS[@]}"; do
+    if [ "$found" = "$preset" ]; then
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+load_toolchain_targets() {
+  local target_path
+
+  expand_toolchain_preset_args
+  load_toolchain_preset_file "$BUILTIN_TOOLCHAIN_PRESETS_FILE"
+  load_toolchain_preset_file "$TOOLCHAIN_PRESETS_FILE"
+  validate_toolchain_presets
+
+  for target_path in "${TOOLCHAIN_PATH_ARGS[@]}"; do
+    register_toolchain_target "cli" "$target_path"
+  done
+}
+
+build_toolchain_setup_script() {
+  local entry suffix target_path script
+
+  script="set -euo pipefail"
+
+  for entry in "${TOOLCHAIN_LINKS[@]}"; do
+    IFS='|' read -r suffix target_path <<<"$entry"
+    script+=$'\n'
+    script+="mkdir -p $(printf '%q' "$TOOLCHAIN_VOLUME_ROOT/$suffix") $(printf '%q' "$(dirname "$target_path")")"
+    script+=$'\n'
+    script+="if [ -L $(printf '%q' "$target_path") ]; then rm -f $(printf '%q' "$target_path"); elif [ -e $(printf '%q' "$target_path") ]; then rm -rf $(printf '%q' "$target_path"); fi"
+    script+=$'\n'
+    script+="ln -s $(printf '%q' "$TOOLCHAIN_VOLUME_ROOT/$suffix") $(printf '%q' "$target_path")"
+  done
+
+  printf '%s' "$script"
+}
+
+build_toolchain_exec_script() {
+  local script
+
+  script="$(build_toolchain_setup_script)"
+  script+=$'\n'
+  script+="exec \"\$@\""
+  printf '%s' "$script"
 }
 
 print_dry_run_command() {
@@ -341,6 +726,26 @@ DOCKER_CMD+=(
   -w "$CONTAINER_PROJECT_PATH"
 )
 
+load_toolchain_targets
+
+echo "Place your global OpenCode config in $HOME/.config/opencode/opencode.json"
+echo "Use global config for user-wide preferences like themes, providers, or keybinds."
+echo ""
+echo "Starting temporary container '$NAME' from image '$IMAGE'"
+echo "  Project: $PROJECT_PATH -> $CONTAINER_WORKDIR"
+echo "  Config:  $CONFIG_DIR -> ${HOME_IN_CONTAINER}/.config/opencode"
+if [ ${#TOOLCHAIN_LINKS[@]} -gt 0 ]; then
+  echo "  Toolchain cache volume: $TOOLCHAIN_VOLUME_NAME -> $TOOLCHAIN_VOLUME_ROOT"
+else
+  echo "  Toolchain cache volume: disabled (no preset or toolchain path selected)"
+fi
+echo "  Forwarded env count: ${#ENV_ARGS[@]}"
+echo ""
+
+if [ ${#TOOLCHAIN_LINKS[@]} -gt 0 ]; then
+  DOCKER_CMD+=("-v" "${TOOLCHAIN_VOLUME_NAME}:${TOOLCHAIN_VOLUME_ROOT}:rw")
+fi
+
 # Append user mounts
 for m in "${MOUNTS[@]}"; do
   mount_arg="$(process_mount "$m")"
@@ -384,60 +789,61 @@ fi
 
 EXEC_CMD=()
 SHELL_EXEC_CMD=()
+BOOTSTRAP_CMD=()
+RUNTIME_CMD=()
+TOOLCHAIN_SETUP_SCRIPT=""
+TOOLCHAIN_EXEC_SCRIPT=""
+
+case "$MODE" in
+  opencode)
+    RUNTIME_CMD=(opencode)
+    ;;
+  web)
+    RUNTIME_CMD=(opencode web)
+    ;;
+  shell)
+    RUNTIME_CMD=(bash)
+    ;;
+  *)
+    echo "Unknown mode: $MODE (expected: opencode, web, shell)" >&2
+    exit 1
+    ;;
+esac
+
+if [ "$MODE" = "opencode" ] || [ "$MODE" = "web" ]; then
+  RUNTIME_CMD+=("${OPENCODE_ARGS[@]}")
+fi
+
+if [ ${#TOOLCHAIN_LINKS[@]} -gt 0 ]; then
+  TOOLCHAIN_SETUP_SCRIPT="$(build_toolchain_setup_script)"
+  TOOLCHAIN_EXEC_SCRIPT="$(build_toolchain_exec_script)"
+fi
 
 if [ "$KEEP_CONTAINER_RUNNING" = true ]; then
   DOCKER_CMD+=("$IMAGE" sleep infinity)
   EXEC_CMD=(docker exec -it -w "$CONTAINER_PROJECT_PATH")
   SHELL_EXEC_CMD=(docker exec -it -w "$CONTAINER_PROJECT_PATH")
+  BOOTSTRAP_CMD=(docker exec)
 
   if [ -n "$USER_SPEC" ]; then
     EXEC_CMD+=("-u" "$USER_SPEC")
     SHELL_EXEC_CMD+=("-u" "$USER_SPEC")
+    BOOTSTRAP_CMD+=("-u" "$USER_SPEC")
   fi
 
   EXEC_CMD+=("$NAME")
   SHELL_EXEC_CMD+=("$NAME" bash)
 
-  case "$MODE" in
-    opencode)
-      EXEC_CMD+=(opencode)
-      ;;
-    web)
-      EXEC_CMD+=(opencode web)
-      ;;
-    shell)
-      EXEC_CMD+=(bash)
-      ;;
-    *)
-      echo "Unknown mode: $MODE (expected: opencode, web, shell)" >&2
-      exit 1
-      ;;
-  esac
-
-  if [ "$MODE" = "opencode" ] || [ "$MODE" = "web" ]; then
-    EXEC_CMD+=("${OPENCODE_ARGS[@]}")
+  if [ -n "$TOOLCHAIN_SETUP_SCRIPT" ]; then
+    BOOTSTRAP_CMD+=("$NAME" bash -lc "$TOOLCHAIN_SETUP_SCRIPT")
   fi
-else
-  # Append image and command by mode
-  case "$MODE" in
-    opencode)
-      DOCKER_CMD+=("$IMAGE" opencode)
-      ;;
-    web)
-      DOCKER_CMD+=("$IMAGE" opencode web)
-      ;;
-    shell)
-      DOCKER_CMD+=("$IMAGE" bash)
-      ;;
-    *)
-      echo "Unknown mode: $MODE (expected: opencode, web, shell)" >&2
-      exit 1
-      ;;
-  esac
 
-  # Append extra args for opencode[ web]
-  if [ "$MODE" = "opencode" ] || [ "$MODE" = "web" ]; then
-    DOCKER_CMD+=("${OPENCODE_ARGS[@]}")
+  EXEC_CMD+=("${RUNTIME_CMD[@]}")
+else
+  if [ -n "$TOOLCHAIN_EXEC_SCRIPT" ]; then
+    DOCKER_CMD+=("$IMAGE" bash -lc "$TOOLCHAIN_EXEC_SCRIPT" bash "${RUNTIME_CMD[@]}")
+  else
+    DOCKER_CMD+=("$IMAGE" "${RUNTIME_CMD[@]}")
   fi
 fi
 
@@ -445,6 +851,10 @@ fi
 if [ "$DRY_RUN" = true ]; then
   if [ "$KEEP_CONTAINER_RUNNING" = true ]; then
     print_dry_run_command "Dry run: detached keepalive container command (each arg on its own line, shell-escaped):" "${DOCKER_CMD[@]}"
+    if [ ${#BOOTSTRAP_CMD[@]} -gt 0 ]; then
+      echo
+      print_dry_run_command "Dry run: toolchain bootstrap command (each arg on its own line, shell-escaped):" "${BOOTSTRAP_CMD[@]}"
+    fi
     echo
     print_dry_run_command "Dry run: interactive session command (each arg on its own line, shell-escaped):" "${EXEC_CMD[@]}"
   else
@@ -456,6 +866,9 @@ fi
 if [ "$KEEP_CONTAINER_RUNNING" = true ]; then
   echo "Keep-running mode enabled: container '$NAME' will remain running after you exit the session."
   CONTAINER_ID=$("${DOCKER_CMD[@]}")
+  if [ ${#BOOTSTRAP_CMD[@]} -gt 0 ]; then
+    "${BOOTSTRAP_CMD[@]}"
+  fi
   echo "Started keepalive container '$NAME' (${CONTAINER_ID})."
   print_reentry_instructions
   echo ""
