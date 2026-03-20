@@ -1,0 +1,407 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+SCRIPT_NAME="opencode-jdk"
+JDKS_DIR="${OPENCODE_JDKS_DIR:-/home/opencode/.jdks}"
+ENV_DIR="${HOME}/.config/opencode/env.d"
+ENV_FILE="${ENV_DIR}/20-java.sh"
+DEFAULT_VENDOR="eclipse"
+DEFAULT_DISTRO="temurin"
+DEFAULT_IMAGE_TYPE="jdk"
+DEFAULT_JVM_IMPL="hotspot"
+DEFAULT_HEAP_SIZE="normal"
+DEFAULT_OS="linux"
+
+usage() {
+  cat <<EOF
+Usage: ${SCRIPT_NAME} <command> [options]
+
+Commands:
+  install <version>        Download and install a JDK, then make it current.
+  use <name>               Point current to an installed JDK directory.
+  list                     List installed JDK directories.
+  current                  Show the active JDK directory.
+  remove <name>            Remove an installed JDK directory.
+  env                      Print the managed Java environment file.
+  help                     Show this help.
+
+Install options:
+  --vendor <name>          API vendor parameter (default: ${DEFAULT_VENDOR})
+  --distro <name>          Local directory prefix (default: ${DEFAULT_DISTRO})
+  --arch <name>            Override detected API architecture.
+  --no-use                 Do not switch current after install.
+
+Examples:
+  ${SCRIPT_NAME} install 21
+  ${SCRIPT_NAME} install 17.0.12+7 --no-use
+  ${SCRIPT_NAME} use temurin-21.0.6+7
+  ${SCRIPT_NAME} list
+EOF
+}
+
+fail() {
+  printf 'Error: %s\n' "$*" >&2
+  exit 1
+}
+
+detect_arch() {
+  case "$(uname -m)" in
+    x86_64|amd64)
+      printf 'x64'
+      ;;
+    aarch64|arm64)
+      printf 'aarch64'
+      ;;
+    *)
+      fail "unsupported architecture '$(uname -m)'"
+      ;;
+  esac
+}
+
+ensure_layout() {
+  mkdir -p "$JDKS_DIR" "$ENV_DIR"
+}
+
+major_from_version() {
+  local version="$1"
+
+  case "$version" in
+    [0-9]*)
+      printf '%s' "${version%%[^0-9]*}"
+      ;;
+    *)
+      fail "unsupported version format '$version'"
+      ;;
+  esac
+}
+
+query_assets() {
+  local version="$1"
+  local arch="$2"
+  local vendor="$3"
+  local major api_url
+
+  major="$(major_from_version "$version")"
+  api_url="https://api.adoptium.net/v3/assets/feature_releases/${major}/ga?architecture=${arch}&heap_size=${DEFAULT_HEAP_SIZE}&image_type=${DEFAULT_IMAGE_TYPE}&jvm_impl=${DEFAULT_JVM_IMPL}&os=${DEFAULT_OS}&page=0&page_size=25&project=jdk&sort_method=DATE&sort_order=DESC&vendor=${vendor}"
+  curl --fail --silent --show-error --location "$api_url"
+}
+
+select_asset() {
+  local version="$1"
+  local asset_json="$2"
+  local jq_filter
+
+  if [ "$version" = "$(major_from_version "$version")" ]; then
+    jq_filter='first(.[] | select(.binaries[0].package.link != null))'
+  else
+    jq_filter=$(cat <<'EOF'
+first(.[]
+  | select(.binaries[0].package.link != null)
+  | select(
+      (.release_name // "") == $version
+      or (.release_name // "" | contains($version))
+      or (.version_data.semver // "" | startswith($version))
+    ))
+EOF
+)
+  fi
+
+  printf '%s' "$asset_json" | jq --arg version "$version" "$jq_filter"
+}
+
+asset_field() {
+  local asset_json="$1"
+  local jq_expr="$2"
+
+  printf '%s' "$asset_json" | jq -r "$jq_expr // empty"
+}
+
+install_jdk() {
+  local version="$1"
+  local vendor="$2"
+  local distro="$3"
+  local arch="$4"
+  local should_use="$5"
+  local assets_json selected_json package_url checksum_url release_name package_name install_name install_dir tmp_dir archive_path expected_sha top_level
+
+  ensure_layout
+
+  assets_json="$(query_assets "$version" "$arch" "$vendor")"
+  selected_json="$(select_asset "$version" "$assets_json")"
+
+  if [ -z "$selected_json" ] || [ "$selected_json" = "null" ]; then
+    fail "could not find a matching JDK release for '$version'"
+  fi
+
+  package_url="$(asset_field "$selected_json" '.binaries[0].package.link')"
+  checksum_url="$(asset_field "$selected_json" '.binaries[0].package.checksum_link')"
+  release_name="$(asset_field "$selected_json" '.release_name')"
+  package_name="$(asset_field "$selected_json" '.binaries[0].package.name')"
+
+  if [ -z "$package_url" ] || [ -z "$release_name" ] || [ -z "$package_name" ]; then
+    fail "JDK release metadata is incomplete for '$version'"
+  fi
+
+  install_name="${distro}-${release_name#jdk-}"
+  install_dir="${JDKS_DIR}/${install_name}"
+
+  if [ -x "${install_dir}/bin/java" ]; then
+    printf 'JDK already installed: %s\n' "$install_name"
+    if [ "$should_use" = true ]; then
+      use_jdk "$install_name"
+    fi
+    return 0
+  fi
+
+  tmp_dir="$(mktemp -d)"
+  archive_path="${tmp_dir}/${package_name}"
+
+  printf 'Downloading %s\n' "$package_url"
+  curl --fail --silent --show-error --location "$package_url" --output "$archive_path"
+
+  if [ -n "$checksum_url" ]; then
+    expected_sha="$(curl --fail --silent --show-error --location "$checksum_url" | tr -d '\r' | awk '{print $1}')"
+    if [ -z "$expected_sha" ]; then
+      fail "failed to read checksum for '$release_name'"
+    fi
+    printf '%s  %s\n' "$expected_sha" "$archive_path" | sha256sum --check --status
+  fi
+
+  mkdir -p "${tmp_dir}/extract"
+  tar -xzf "$archive_path" -C "${tmp_dir}/extract"
+  top_level="$(glob_top_level_dir "${tmp_dir}/extract")"
+
+  rm -rf "$install_dir"
+  mkdir -p "$install_dir"
+
+  if [ -n "$top_level" ]; then
+    cp -a "${top_level}/." "$install_dir/"
+  else
+    cp -a "${tmp_dir}/extract/." "$install_dir/"
+  fi
+
+  if [ ! -x "${install_dir}/bin/java" ]; then
+    fail "installed JDK at '$install_dir' does not contain bin/java"
+  fi
+
+  printf 'Installed %s\n' "$install_name"
+
+  if [ "$should_use" = true ]; then
+    use_jdk "$install_name"
+  fi
+
+  rm -rf "$tmp_dir"
+}
+
+glob_top_level_dir() {
+  local extract_dir="$1"
+  local entry top_dir_count=0 top_dir=""
+
+  for entry in "$extract_dir"/*; do
+    if [ -d "$entry" ]; then
+      top_dir="$entry"
+      top_dir_count=$((top_dir_count + 1))
+    elif [ -e "$entry" ]; then
+      printf ''
+      return 0
+    fi
+  done
+
+  if [ "$top_dir_count" -eq 1 ]; then
+    printf '%s' "$top_dir"
+  fi
+}
+
+write_env_file() {
+  local current_target="$1"
+
+  cat > "$ENV_FILE" <<EOF
+export JAVA_HOME="${current_target}"
+export JDK_HOME="${current_target}"
+case ":\${PATH}:" in
+  *":\${JAVA_HOME}/bin:"*) ;;
+  *) export PATH="\${JAVA_HOME}/bin:\${PATH}" ;;
+esac
+EOF
+}
+
+use_jdk() {
+  local requested="$1"
+  local target
+
+  ensure_layout
+  target="$(resolve_jdk_dir "$requested" || true)"
+
+  if [ -z "$target" ]; then
+    fail "unknown JDK '$requested'"
+  fi
+
+  ln -sfn "$target" "${JDKS_DIR}/current"
+  write_env_file "${JDKS_DIR}/current"
+  printf 'Active JDK: %s\n' "$(basename "$target")"
+  printf 'Run %q to refresh the current shell.\n' "source /usr/local/bin/opencode-load-env"
+}
+
+resolve_jdk_dir() {
+  local requested="$1"
+  local candidate
+
+  if [ -d "$requested" ] && [ -x "$requested/bin/java" ]; then
+    printf '%s' "$requested"
+    return 0
+  fi
+
+  if [ -d "${JDKS_DIR}/${requested}" ] && [ -x "${JDKS_DIR}/${requested}/bin/java" ]; then
+    printf '%s' "${JDKS_DIR}/${requested}"
+    return 0
+  fi
+
+  for candidate in "${JDKS_DIR}"/*; do
+    if [ -d "$candidate" ] && [ "$(basename "$candidate")" = "$requested" ]; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+list_jdks() {
+  local current_target=""
+  local candidate
+
+  ensure_layout
+
+  if [ -L "${JDKS_DIR}/current" ]; then
+    current_target="$(readlink -f "${JDKS_DIR}/current")"
+  fi
+
+  shopt -s nullglob
+  for candidate in "${JDKS_DIR}"/*; do
+    if [ ! -d "$candidate" ] || [ "$(basename "$candidate")" = "current" ]; then
+      continue
+    fi
+
+    if [ -n "$current_target" ] && [ "$(readlink -f "$candidate")" = "$current_target" ]; then
+      printf '* %s\n' "$(basename "$candidate")"
+    else
+      printf '  %s\n' "$(basename "$candidate")"
+    fi
+  done
+  shopt -u nullglob
+}
+
+show_current() {
+  if [ -L "${JDKS_DIR}/current" ]; then
+    readlink -f "${JDKS_DIR}/current"
+  else
+    fail "no active JDK is configured"
+  fi
+}
+
+remove_jdk() {
+  local requested="$1"
+  local target current_target=""
+
+  target="$(resolve_jdk_dir "$requested" || true)"
+
+  if [ -z "$target" ]; then
+    fail "unknown JDK '$requested'"
+  fi
+
+  if [ -L "${JDKS_DIR}/current" ]; then
+    current_target="$(readlink -f "${JDKS_DIR}/current")"
+  fi
+
+  rm -rf "$target"
+
+  if [ -n "$current_target" ] && [ "$current_target" = "$target" ]; then
+    rm -f "${JDKS_DIR}/current" "$ENV_FILE"
+  fi
+
+  printf 'Removed %s\n' "$(basename "$target")"
+}
+
+show_env_file() {
+  if [ -f "$ENV_FILE" ]; then
+    cat "$ENV_FILE"
+  else
+    fail "managed Java environment file does not exist"
+  fi
+}
+
+main() {
+  local command="${1:-help}"
+  local version vendor distro arch should_use
+
+  vendor="$DEFAULT_VENDOR"
+  distro="$DEFAULT_DISTRO"
+  arch="$(detect_arch)"
+  should_use=true
+
+  case "$command" in
+    help|-h|--help)
+      usage
+      ;;
+    install)
+      shift
+      version="${1:-}"
+      if [ -z "$version" ]; then
+        fail "install requires a version"
+      fi
+      shift
+      while [ "$#" -gt 0 ]; do
+        case "$1" in
+          --vendor)
+            vendor="${2:-}"
+            [ -n "$vendor" ] || fail "--vendor requires a value"
+            shift 2
+            ;;
+          --distro)
+            distro="${2:-}"
+            [ -n "$distro" ] || fail "--distro requires a value"
+            shift 2
+            ;;
+          --arch)
+            arch="${2:-}"
+            [ -n "$arch" ] || fail "--arch requires a value"
+            shift 2
+            ;;
+          --no-use)
+            should_use=false
+            shift
+            ;;
+          *)
+            fail "unknown install option '$1'"
+            ;;
+        esac
+      done
+      install_jdk "$version" "$vendor" "$distro" "$arch" "$should_use"
+      ;;
+    use)
+      shift
+      [ "$#" -gt 0 ] || fail "use requires an installed JDK name"
+      use_jdk "$1"
+      ;;
+    list)
+      list_jdks
+      ;;
+    current)
+      show_current
+      ;;
+    remove)
+      shift
+      [ "$#" -gt 0 ] || fail "remove requires an installed JDK name"
+      remove_jdk "$1"
+      ;;
+    env)
+      show_env_file
+      ;;
+    *)
+      fail "unknown command '$command'"
+      ;;
+  esac
+}
+
+main "$@"

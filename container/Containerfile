@@ -13,6 +13,7 @@ LABEL org.opencontainers.image.title="OpenCode Sandbox" \
       org.opencontainers.image.documentation="https://github.com/roll-w/opencode-sandbox"
 
 ENV DEBIAN_FRONTEND=noninteractive
+ENV OPENCODE_JDKS_DIR=/home/opencode/.jdks
 ENV PLAYWRIGHT_BROWSERS_PATH=/home/opencode/.cache/ms-playwright
 
 # Install base packages
@@ -62,11 +63,23 @@ RUN set -eux; \
     fi; \
     mkdir -p /workspace \
              /home/opencode/.config/opencode \
+             /home/opencode/.config/opencode/env.d \
              /home/opencode/.local/share/opencode \
              /home/opencode/.local/state/opencode \
              /home/opencode/.cache/opencode \
+             /home/opencode/.cache/go-build \
+             /home/opencode/.cache/ms-playwright \
+             /home/opencode/.cache/pip \
              /home/opencode/.bun \
-             /home/opencode/.pnpm-store; \
+             /home/opencode/.cargo \
+             /home/opencode/.gradle \
+             /home/opencode/.jdks \
+             /home/opencode/.m2 \
+             /home/opencode/.nuget/packages \
+             /home/opencode/.npm \
+             /home/opencode/.pnpm-store \
+             /home/opencode/.rustup \
+             /home/opencode/go; \
     chown -R opencode:opencode /home/opencode /workspace
 
 RUN npm install -g pnpm@latest \
@@ -94,7 +107,11 @@ WORKDIR /workspace
 
 # Simple entrypoint script
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN chmod +x /usr/local/bin/entrypoint.sh
+COPY opencode-load-env.sh /usr/local/bin/opencode-load-env
+COPY opencode-jdk /usr/local/bin/opencode-jdk
+RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/opencode-load-env /usr/local/bin/opencode-jdk \
+    && printf '%s\n' '[ -r /usr/local/bin/opencode-load-env ] && . /usr/local/bin/opencode-load-env' > /etc/profile.d/opencode-env.sh \
+    && printf '\n%s\n' '[ -r /usr/local/bin/opencode-load-env ] && . /usr/local/bin/opencode-load-env' >> /etc/bash.bashrc
 
 # Switch to non-root user by default
 USER opencode:opencode

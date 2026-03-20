@@ -25,12 +25,12 @@ Options:
                             Additional mount (repeatable). HOST may be relative; CONTAINER
                             may be absolute or relative to the container workdir.
       --toolchain-volume-name NAME
-                            Shared Docker volume name for toolchain caches.
+                            Base Docker volume name prefix for grouped toolchain cache volumes.
       --toolchain-preset NAME
                             Enable a toolchain preset or comma-separated preset list.
                             Repeatable. No default presets are enabled.
       --toolchain-path CONTAINER_PATH
-                            Add an extra container path into the shared toolchain volume.
+                            Add an extra container path that mounts from the shared CLI toolchain volume.
       --dry-run             Print the final docker command and exit without running it
   -E, --env KEY=VAL         Pass an environment variable into the container (may repeat)
       --env-file FILE       Pass an env file to docker (each line VAR=VAL)
@@ -53,10 +53,11 @@ Arguments after -- are forwarded as CLI options to opencode or opencode web (not
   $0 --mode shell
   $0 -P http://proxy:3128 -E OPENCODE_DISABLE_LSP_DOWNLOAD=false
   $0 -p 8080:8080 -N host /path/to/project
-  $0 --toolchain-preset maven,gradle,go /path/to/project
+  $0 --toolchain-preset java,go /path/to/project
   $0 --toolchain-preset dotnet --toolchain-path /home/opencode/.cache/uv /path/to/project
 
-Toolchain cache targets share one Docker volume.
+Toolchain cache targets selected through the same preset share one Docker volume.
+Each target mounts its own subdirectory from that shared volume.
 Presets are loaded from config/toolchain-volume-presets.conf in this repo and from
 the configured config dir's toolchain-volume-presets.conf when present.
 Each non-empty preset line should use: preset_name:container_path
@@ -94,7 +95,8 @@ AUTO_FORWARD_OPENCODE=true
 # - mode: optional, either 'ro' or 'rw' (default: rw)
 MOUNTS=()
 TOOLCHAIN_VOLUME_TARGETS=()
-TOOLCHAIN_LINKS=()
+TOOLCHAIN_VOLUME_MOUNTS=()
+TOOLCHAIN_SHARED_VOLUMES=()
 FOUND_TOOLCHAIN_PRESETS=()
 DRY_RUN=false
 PULL_UPDATE=false
@@ -106,6 +108,7 @@ OPENCODE_ARGS=()
 USER_SPEC=""
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TOOLCHAIN_VOLUME_NAME="opencode-sandbox-toolchains"
+TOOLCHAIN_PREPARE_MOUNT_PATH="/toolchain-volume"
 TOOLCHAIN_PRESET_ARGS=()
 TOOLCHAIN_PRESETS=()
 TOOLCHAIN_PATH_ARGS=()
@@ -232,8 +235,6 @@ if [ -n "$USER_SPEC" ]; then
 else
   HOME_IN_CONTAINER="/home/opencode"
 fi
-
-TOOLCHAIN_VOLUME_ROOT="${HOME_IN_CONTAINER}/.toolchain-cache"
 
 PNPM_STORE_HOST="${HOME}/.local/share/pnpm/store"
 if command -v pnpm >/dev/null 2>&1; then
@@ -494,19 +495,61 @@ is_selected_toolchain_preset() {
   return 1
 }
 
-toolchain_subdir_name() {
-  local target_path="$1"
-  local digest
+toolchain_volume_name_for_group() {
+  local source_name="$1"
+  local normalized_source digest
 
-  if command -v sha256sum >/dev/null 2>&1; then
-    digest=$(printf '%s' "$target_path" | sha256sum)
-    digest=${digest%% *}
-    printf 'toolchain-%s' "$digest"
-    return
+  normalized_source="$(printf '%s' "$source_name" | tr '[:upper:]' '[:lower:]' | tr -c '[:alnum:]_.-' '-')"
+  normalized_source="${normalized_source#-}"
+  normalized_source="${normalized_source%-}"
+
+  if [ -z "$normalized_source" ]; then
+    normalized_source="toolchain"
   fi
 
+  set -- $(printf '%s' "$source_name" | cksum)
+  digest="$1"
+  printf '%s-%s-%s' "$TOOLCHAIN_VOLUME_NAME" "$normalized_source" "$digest"
+}
+
+toolchain_subpath_for_target() {
+  local target_path="$1"
+
   set -- $(printf '%s' "$target_path" | cksum)
-  printf 'toolchain-%s' "$1"
+  printf 'target-%s' "$1"
+}
+
+has_toolchain_shared_volume() {
+  local volume_name="$1"
+  local existing
+
+  for existing in "${TOOLCHAIN_SHARED_VOLUMES[@]}"; do
+    if [ "$existing" = "$volume_name" ]; then
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+find_toolchain_target_conflict() {
+  local target="$1"
+  local existing
+
+  target="$(normalize_container_path "$target")"
+
+  for existing in "${TOOLCHAIN_VOLUME_TARGETS[@]}"; do
+    if [ "$target" = "$existing" ]; then
+      continue
+    fi
+
+    if paths_overlap "$target" "$existing"; then
+      printf '%s' "$existing"
+      return 0
+    fi
+  done
+
+  return 1
 }
 
 mark_toolchain_preset_found() {
@@ -526,7 +569,9 @@ register_toolchain_target() {
   local source_name="$1"
   local target_path="$2"
   local conflicting_bind_target
-  local subdir
+  local conflicting_toolchain_target
+  local volume_name
+  local subpath
 
   if [ -z "$source_name" ]; then
     echo "Invalid toolchain source name: '$source_name'" >&2; return 1
@@ -543,10 +588,16 @@ register_toolchain_target() {
     return 1
   fi
 
-  subdir="$(toolchain_subdir_name "$target_path")"
+  volume_name="$(toolchain_volume_name_for_group "$source_name")"
+  subpath="$(toolchain_subpath_for_target "$target_path")"
 
   if conflicting_bind_target="$(find_bind_target_conflict "$target_path")"; then
     echo "Error: toolchain target '$target_path' overlaps bind mount target '$conflicting_bind_target'." >&2
+    return 1
+  fi
+
+  if conflicting_toolchain_target="$(find_toolchain_target_conflict "$target_path")"; then
+    echo "Error: toolchain target '$target_path' overlaps toolchain target '$conflicting_toolchain_target'." >&2
     return 1
   fi
 
@@ -555,7 +606,10 @@ register_toolchain_target() {
   fi
 
   TOOLCHAIN_VOLUME_TARGETS+=("$target_path")
-  TOOLCHAIN_LINKS+=("${subdir}|${target_path}")
+  if ! has_toolchain_shared_volume "$volume_name"; then
+    TOOLCHAIN_SHARED_VOLUMES+=("$volume_name")
+  fi
+  TOOLCHAIN_VOLUME_MOUNTS+=("${volume_name}|${subpath}|${target_path}|${source_name}")
 }
 
 load_toolchain_preset_file() {
@@ -630,33 +684,6 @@ load_toolchain_targets() {
   done
 }
 
-build_toolchain_setup_script() {
-  local entry suffix target_path script
-
-  script="set -euo pipefail"
-
-  for entry in "${TOOLCHAIN_LINKS[@]}"; do
-    IFS='|' read -r suffix target_path <<<"$entry"
-    script+=$'\n'
-    script+="mkdir -p $(printf '%q' "$TOOLCHAIN_VOLUME_ROOT/$suffix") $(printf '%q' "$(dirname "$target_path")")"
-    script+=$'\n'
-    script+="if [ -L $(printf '%q' "$target_path") ]; then rm -f $(printf '%q' "$target_path"); elif [ -e $(printf '%q' "$target_path") ]; then rm -rf $(printf '%q' "$target_path"); fi"
-    script+=$'\n'
-    script+="ln -s $(printf '%q' "$TOOLCHAIN_VOLUME_ROOT/$suffix") $(printf '%q' "$target_path")"
-  done
-
-  printf '%s' "$script"
-}
-
-build_toolchain_exec_script() {
-  local script
-
-  script="$(build_toolchain_setup_script)"
-  script+=$'\n'
-  script+="exec \"\$@\""
-  printf '%s' "$script"
-}
-
 print_dry_run_command() {
   local title="$1"
   local one_line
@@ -701,6 +728,56 @@ print_reentry_instructions() {
   printf 'Stop and remove with: docker rm -f %q\n' "$NAME"
 }
 
+build_toolchain_prepare_script() {
+  local volume_name="$1"
+  local toolchain_mount mount_volume subpath target_path source_name script
+
+  script="set -euo pipefail"
+
+  for toolchain_mount in "${TOOLCHAIN_VOLUME_MOUNTS[@]}"; do
+    IFS='|' read -r mount_volume subpath target_path source_name <<<"$toolchain_mount"
+    if [ "$mount_volume" != "$volume_name" ]; then
+      continue
+    fi
+
+    script+=$'\n'
+    script+="mkdir -p $(printf '%q' "$TOOLCHAIN_PREPARE_MOUNT_PATH/$subpath")"
+  done
+
+  printf '%s' "$script"
+}
+
+print_toolchain_prepare_commands() {
+  local volume_name script
+  local -a prepare_cmd
+
+  for volume_name in "${TOOLCHAIN_SHARED_VOLUMES[@]}"; do
+    script="$(build_toolchain_prepare_script "$volume_name")"
+    prepare_cmd=(docker run --rm)
+    if [ -n "$USER_SPEC" ]; then
+      prepare_cmd+=(--user "$USER_SPEC")
+    fi
+    prepare_cmd+=(--mount "type=volume,src=${volume_name},dst=${TOOLCHAIN_PREPARE_MOUNT_PATH}" "$IMAGE" bash -lc "$script")
+    print_dry_run_command "Dry run: toolchain prepare command for ${volume_name} (each arg on its own line, shell-escaped):" "${prepare_cmd[@]}"
+    echo
+  done
+}
+
+run_toolchain_prepare_commands() {
+  local volume_name script
+  local -a prepare_cmd
+
+  for volume_name in "${TOOLCHAIN_SHARED_VOLUMES[@]}"; do
+    script="$(build_toolchain_prepare_script "$volume_name")"
+    prepare_cmd=(docker run --rm)
+    if [ -n "$USER_SPEC" ]; then
+      prepare_cmd+=(--user "$USER_SPEC")
+    fi
+    prepare_cmd+=(--mount "type=volume,src=${volume_name},dst=${TOOLCHAIN_PREPARE_MOUNT_PATH}" "$IMAGE" bash -lc "$script")
+    "${prepare_cmd[@]}"
+  done
+}
+
 # Build docker run command
 if [ "$KEEP_CONTAINER_RUNNING" = true ]; then
   DOCKER_CMD=(docker run -d \
@@ -734,17 +811,22 @@ echo ""
 echo "Starting temporary container '$NAME' from image '$IMAGE'"
 echo "  Project: $PROJECT_PATH -> $CONTAINER_WORKDIR"
 echo "  Config:  $CONFIG_DIR -> ${HOME_IN_CONTAINER}/.config/opencode"
-if [ ${#TOOLCHAIN_LINKS[@]} -gt 0 ]; then
-  echo "  Toolchain cache volume: $TOOLCHAIN_VOLUME_NAME -> $TOOLCHAIN_VOLUME_ROOT"
+if [ ${#TOOLCHAIN_VOLUME_MOUNTS[@]} -gt 0 ]; then
+  echo "  Toolchain cache mounts:"
+  for toolchain_mount in "${TOOLCHAIN_VOLUME_MOUNTS[@]}"; do
+    IFS='|' read -r volume_name subpath target_path source_name <<<"$toolchain_mount"
+    echo "    $source_name: $volume_name:$subpath -> $target_path"
+  done
 else
-  echo "  Toolchain cache volume: disabled (no preset or toolchain path selected)"
+  echo "  Toolchain cache mounts: disabled (no preset or toolchain path selected)"
 fi
 echo "  Forwarded env count: ${#ENV_ARGS[@]}"
 echo ""
 
-if [ ${#TOOLCHAIN_LINKS[@]} -gt 0 ]; then
-  DOCKER_CMD+=("-v" "${TOOLCHAIN_VOLUME_NAME}:${TOOLCHAIN_VOLUME_ROOT}:rw")
-fi
+for toolchain_mount in "${TOOLCHAIN_VOLUME_MOUNTS[@]}"; do
+  IFS='|' read -r volume_name subpath target_path source_name <<<"$toolchain_mount"
+  DOCKER_CMD+=("--mount" "type=volume,src=${volume_name},dst=${target_path},volume-subpath=${subpath}")
+done
 
 # Append user mounts
 for m in "${MOUNTS[@]}"; do
@@ -789,10 +871,7 @@ fi
 
 EXEC_CMD=()
 SHELL_EXEC_CMD=()
-BOOTSTRAP_CMD=()
 RUNTIME_CMD=()
-TOOLCHAIN_SETUP_SCRIPT=""
-TOOLCHAIN_EXEC_SCRIPT=""
 
 case "$MODE" in
   opencode)
@@ -814,47 +893,32 @@ if [ "$MODE" = "opencode" ] || [ "$MODE" = "web" ]; then
   RUNTIME_CMD+=("${OPENCODE_ARGS[@]}")
 fi
 
-if [ ${#TOOLCHAIN_LINKS[@]} -gt 0 ]; then
-  TOOLCHAIN_SETUP_SCRIPT="$(build_toolchain_setup_script)"
-  TOOLCHAIN_EXEC_SCRIPT="$(build_toolchain_exec_script)"
-fi
-
 if [ "$KEEP_CONTAINER_RUNNING" = true ]; then
   DOCKER_CMD+=("$IMAGE" sleep infinity)
   EXEC_CMD=(docker exec -it -w "$CONTAINER_PROJECT_PATH")
   SHELL_EXEC_CMD=(docker exec -it -w "$CONTAINER_PROJECT_PATH")
-  BOOTSTRAP_CMD=(docker exec)
 
   if [ -n "$USER_SPEC" ]; then
     EXEC_CMD+=("-u" "$USER_SPEC")
     SHELL_EXEC_CMD+=("-u" "$USER_SPEC")
-    BOOTSTRAP_CMD+=("-u" "$USER_SPEC")
   fi
 
-  EXEC_CMD+=("$NAME")
-  SHELL_EXEC_CMD+=("$NAME" bash)
-
-  if [ -n "$TOOLCHAIN_SETUP_SCRIPT" ]; then
-    BOOTSTRAP_CMD+=("$NAME" bash -lc "$TOOLCHAIN_SETUP_SCRIPT")
-  fi
+  EXEC_CMD+=("$NAME" /usr/local/bin/opencode-load-env)
+  SHELL_EXEC_CMD+=("$NAME" /usr/local/bin/opencode-load-env bash)
 
   EXEC_CMD+=("${RUNTIME_CMD[@]}")
 else
-  if [ -n "$TOOLCHAIN_EXEC_SCRIPT" ]; then
-    DOCKER_CMD+=("$IMAGE" bash -lc "$TOOLCHAIN_EXEC_SCRIPT" bash "${RUNTIME_CMD[@]}")
-  else
-    DOCKER_CMD+=("$IMAGE" "${RUNTIME_CMD[@]}")
-  fi
+  DOCKER_CMD+=("$IMAGE" "${RUNTIME_CMD[@]}")
 fi
 
 # If dry run, print final command and exit
 if [ "$DRY_RUN" = true ]; then
+  if [ ${#TOOLCHAIN_SHARED_VOLUMES[@]} -gt 0 ]; then
+    print_toolchain_prepare_commands
+  fi
+
   if [ "$KEEP_CONTAINER_RUNNING" = true ]; then
     print_dry_run_command "Dry run: detached keepalive container command (each arg on its own line, shell-escaped):" "${DOCKER_CMD[@]}"
-    if [ ${#BOOTSTRAP_CMD[@]} -gt 0 ]; then
-      echo
-      print_dry_run_command "Dry run: toolchain bootstrap command (each arg on its own line, shell-escaped):" "${BOOTSTRAP_CMD[@]}"
-    fi
     echo
     print_dry_run_command "Dry run: interactive session command (each arg on its own line, shell-escaped):" "${EXEC_CMD[@]}"
   else
@@ -865,10 +929,12 @@ fi
 
 if [ "$KEEP_CONTAINER_RUNNING" = true ]; then
   echo "Keep-running mode enabled: container '$NAME' will remain running after you exit the session."
-  CONTAINER_ID=$("${DOCKER_CMD[@]}")
-  if [ ${#BOOTSTRAP_CMD[@]} -gt 0 ]; then
-    "${BOOTSTRAP_CMD[@]}"
+
+  if [ ${#TOOLCHAIN_SHARED_VOLUMES[@]} -gt 0 ]; then
+    run_toolchain_prepare_commands
   fi
+
+  CONTAINER_ID=$("${DOCKER_CMD[@]}")
   echo "Started keepalive container '$NAME' (${CONTAINER_ID})."
   print_reentry_instructions
   echo ""
@@ -885,4 +951,8 @@ if [ "$KEEP_CONTAINER_RUNNING" = true ]; then
 fi
 
 # Execute
+if [ ${#TOOLCHAIN_SHARED_VOLUMES[@]} -gt 0 ]; then
+  run_toolchain_prepare_commands
+fi
+
 "${DOCKER_CMD[@]}"
