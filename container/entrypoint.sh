@@ -2,6 +2,8 @@
 
 set -euo pipefail
 
+[ -r /usr/local/bin/opencode-load-env ] && . /usr/local/bin/opencode-load-env
+
 pnpm config set store-dir "${HOME}/.pnpm-store" --global 2>/dev/null || true
 
 CURRENT_UID=$(id -u)
