@@ -84,7 +84,6 @@ RUN set -eux; \
 RUN npm install -g pnpm@latest \
     && npx playwright install --with-deps --no-shell chromium \
     && pnpm config set store-dir /home/opencode/.pnpm-store \
-    && npm install -g @fission-ai/openspec@latest  \
     && npm install -g agent-browser  \
     && rm -rf /var/lib/apt/lists/*
 
