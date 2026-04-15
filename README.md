@@ -1,5 +1,8 @@
 # OpenCode Sandbox
 
+> [!NOTE]
+> Tip: When running inside the container, use [host-bridge-mcp](https://github.com/roll-w/host-bridge-mcp) if you need access to host machine toolchains or remote servers.
+
 OpenCode Sandbox provides a lightweight container-based environment for running the [OpenCode](https://github.com/anomalyco/opencode) project and related tooling in an isolated, reproducible container.
 
 It bundles a small developer image (see `container/Containerfile`) with common tools installed so you can quickly open a workspace, run the OpenCode CLI, and iterate on projects without polluting your host environment.
