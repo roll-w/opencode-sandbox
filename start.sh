@@ -796,7 +796,7 @@ DOCKER_CMD+=(
   -v "$HOME/.cache/opencode:${HOME_IN_CONTAINER}/.cache/opencode:rw" \
   -v "$HOME/.local/state/opencode:${HOME_IN_CONTAINER}/.local/state/opencode:rw" \
   -v "$HOME/.local/share/opencode:${HOME_IN_CONTAINER}/.local/share/opencode:rw" \
-  -v "$HOME/.config/opencode:${HOME_IN_CONTAINER}/.config/opencode:rw" \
+  -v "$CONFIG_DIR:${HOME_IN_CONTAINER}/.config/opencode:rw" \
   -v "$HOME/.agents:${HOME_IN_CONTAINER}/.agents:rw" \
   -v "$HOME/.config/openspec:${HOME_IN_CONTAINER}/.config/openspec:rw" \
   -v "$PROJECT_HOST_PATH:$CONTAINER_PROJECT_PATH:rw" \
